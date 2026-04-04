@@ -116,13 +116,13 @@ def _shares_mfe(delta_inside, sigma, xi, nest_matrix, availability_matrix):
     J_in = delta_inside.shape[0]
     T = availability_matrix.shape[1]
 
-    def shares_at_t(t):
-        delta_full = jnp.concatenate([delta_inside, xi[t:t+1]])
-        avail_t = availability_matrix[:, t:t+1]
-        _, _, s_jt = _shares_pipeline_delta(delta_full, sigma, nest_matrix, avail_t)
+    def shares_at_t(xi_t, avail_t):
+        delta_full = jnp.concatenate([delta_inside, jnp.array([xi_t])])
+        _, _, s_jt = _shares_pipeline_delta(delta_full, sigma, nest_matrix, avail_t[:, None])
         return s_jt[:, 0]
 
-    return jax.vmap(shares_at_t)(jnp.arange(T)).T  # (J, T)
+    # vmap over (xi_t, avail columns)
+    return jax.vmap(shares_at_t, in_axes=(0, 1), out_axes=1)(xi, availability_matrix)  # (J, T)
 
 
 def _diversion_from_formula(theta, nest_matrix, availability_matrix_full):
