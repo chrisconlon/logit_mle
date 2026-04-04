@@ -1,8 +1,12 @@
 """
 Logit discrete choice model.
 
-Parameters: delta[J-1] (mean utility for inside goods; outside good normalized to 0).
-Diversion: closed-form D_jk = s_k / (1 - s_j) under full availability.
+Parameters:
+  - delta[J-1]: mean utility for inside goods (outside good normalized to 0)
+  - xi[T-1]:    outside good's mean utility per market (only if market_fe=True;
+                last market normalized to 0)
+
+Diversion: closed-form IIA formula D_jk = s_k / (1 - s_j), evaluated at xi=0.
 """
 from __future__ import annotations
 
@@ -18,28 +22,35 @@ from .base import DiscreteChoiceModel
 # ── JAX computation functions ────────────────────────────────────
 
 @jax.jit
-def _v_jt(theta, availability_matrix):
-    """Deterministic utility. Shape (J, T)."""
-    delta = jnp.concatenate([theta, jnp.array([0.0])])
-    return jnp.where(availability_matrix, delta[:, None], -jnp.inf)
+def _s_jt(delta_inside, xi, availability_matrix):
+    """Market shares. Shape (J, T).
 
+    delta_inside : (J-1,) mean utility for inside goods
+    xi           : (T,)   outside good's utility per market
+    """
+    J_in = delta_inside.shape[0]
+    T = availability_matrix.shape[1]
 
-@jax.jit
-def _s_jt(theta, availability_matrix):
-    """Market shares. Shape (J, T)."""
-    vjt = _v_jt(theta, availability_matrix)
+    # (J, T) utility: inside goods constant across t, outside good = xi_t
+    delta_jt = jnp.concatenate([
+        jnp.broadcast_to(delta_inside[:, None], (J_in, T)),
+        xi[None, :],
+    ], axis=0)
+
+    vjt = jnp.where(availability_matrix, delta_jt, -jnp.inf)
     return jax.nn.softmax(vjt, axis=0)
 
 
 @jax.jit
-def _diversion_jk(theta, availability_matrix_full):
-    """Closed-form logit diversion under full availability, market 0. Shape (J, J)."""
-    sjt = _s_jt(theta, availability_matrix_full)
-    s_j = sjt[:, 0]  # (J,) — all markets identical under full availability
+def _diversion_jk(delta_inside, availability_matrix_full):
+    """Closed-form logit diversion at xi=0. Shape (J, J)."""
+    T = availability_matrix_full.shape[1]
+    xi_zero = jnp.zeros(T)
+    sjt = _s_jt(delta_inside, xi_zero, availability_matrix_full)
+    s_j = sjt[:, 0]  # all markets identical at xi=0 under full availability
     J = s_j.shape[0]
 
-    # D_jk = s_k / (1 - s_j)
-    D_jk = s_j[None, :] / (1.0 - s_j[:, None])  # (J, J)
+    D_jk = s_j[None, :] / (1.0 - s_j[:, None])
     D_jk = D_jk.at[jnp.diag_indices(J)].set(0.0)
     return D_jk
 
@@ -48,32 +59,52 @@ def _diversion_jk(theta, availability_matrix_full):
 
 class Logit(DiscreteChoiceModel):
 
-    def __init__(self, availability_matrix, q_jt=None, *, diversion_data=None):
+    def __init__(self, availability_matrix, q_jt=None, *, market_fe=False,
+                 diversion_data=None):
         super().__init__(availability_matrix, q_jt, diversion_data=diversion_data)
-
-    def _compute_shares(self, theta, avail):
-        return _s_jt(theta, avail)
-
-    def _compute_diversion(self, theta):
-        return _diversion_jk(theta, self._availability_matrix_full)
+        self.market_fe = market_fe
 
     def _unpack_theta(self, theta):
-        delta = jnp.concatenate([theta, jnp.array([0.0])])
-        return {"delta": delta}
+        delta_inside = theta[:self.J - 1]
+        delta = jnp.concatenate([delta_inside, jnp.array([0.0])])
+        if self.market_fe:
+            xi = jnp.concatenate([theta[self.J - 1:], jnp.array([0.0])])
+        else:
+            xi = jnp.zeros(self.T)
+        return {"delta": delta, "delta_inside": delta_inside, "xi": xi}
+
+    def _compute_shares(self, theta, avail):
+        p = self._unpack_theta(theta)
+        return _s_jt(p["delta_inside"], p["xi"], avail)
+
+    def _compute_diversion(self, theta):
+        p = self._unpack_theta(theta)
+        return _diversion_jk(p["delta_inside"], self._availability_matrix_full)
 
     def _make_x0(self, rng):
-        return jnp.array(rng.uniform(-10, -1, self.J - 1))
+        delta = rng.uniform(-10, -1, self.J - 1)
+        if self.market_fe:
+            xi = rng.uniform(-1, 1, self.T - 1)
+            return jnp.array(np.concatenate([delta, xi]))
+        return jnp.array(delta)
 
     def _theta_bounds(self):
-        return [(-30, 30)] * (self.J - 1)
+        bounds = [(-30, 30)] * (self.J - 1)
+        if self.market_fe:
+            bounds += [(-30, 30)] * (self.T - 1)
+        return bounds
 
     def _compute_jacobian(self, theta):
-        """Closed-form Jacobian: ∂s_j/∂δ_k = s_k(1_{j=k} - s_j). Shape (J, J)."""
-        s = _s_jt(theta, self._availability_matrix_full)[:, 0]  # (J,)
+        """Closed-form Jacobian at xi=0: ∂s_j/∂δ_k = s_k(1_{j=k} - s_j)."""
+        p = self._unpack_theta(theta)
+        xi_zero = jnp.zeros(self.T)
+        s = _s_jt(p["delta_inside"], xi_zero, self._availability_matrix_full)[:, 0]
         return jnp.diag(s) - jnp.outer(s, s)
 
     def _compute_elasticity(self, theta, prices, price_coeff, price_col):
-        """Logit price elasticity: η_jk = α · p_k · s_k · (1_{j=k} - s_j) / s_j."""
-        s = _s_jt(theta, self._availability_matrix_full)[:, 0]
+        """Logit price elasticity at xi=0."""
+        p = self._unpack_theta(theta)
+        xi_zero = jnp.zeros(self.T)
+        s = _s_jt(p["delta_inside"], xi_zero, self._availability_matrix_full)[:, 0]
         jac = jnp.diag(s) - jnp.outer(s, s)
         return price_coeff * prices[None, :] * jac / s[:, None]

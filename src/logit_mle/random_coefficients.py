@@ -6,9 +6,11 @@ Covers both RCN (market_fe=False) and RCC (market_fe=True).
 Parameters:
   - delta[J-1]: mean utility (outside good normalized to 0)
   - sigma[G]:   std dev of taste heterogeneity per characteristic
-  - xi[T-1]:    market fixed effects (only if market_fe=True; last market normalized to 0)
+  - xi[T-1]:    outside good's mean utility per market (only if market_fe=True;
+                last market normalized to 0)
 
-Diversion: D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ] integrated over sparse grid.
+Diversion: D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ] integrated over sparse grid,
+evaluated at xi=0 (structural diversion).
 """
 from __future__ import annotations
 
@@ -26,12 +28,20 @@ UTILITY_PUNISH = -1e20
 # ── JAX computation functions ────────────────────────────────────
 
 @jax.jit
-def _v_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix):
-    """Individual-level utility. Shape (I, J, T)."""
+def _v_ijt(delta_inside, sigma, xi, x_jg, nu_i, availability_matrix):
+    """Individual-level utility. Shape (I, J, T).
+
+    delta_inside : (J-1,)  mean utility for inside goods
+    sigma        : (G,)    std dev of random coefficients
+    xi           : (T,)    outside good's utility per market
+    x_jg         : (J, G)  product characteristics (including outside good)
+    nu_i         : (I, G)  quadrature nodes
+    """
     I = nu_i.shape[0]
     J = x_jg.shape[0]
     G = x_jg.shape[1]
     T = availability_matrix.shape[1]
+    J_in = J - 1
 
     # Random coefficient interaction: sum_g x_jg * nu_ig * sigma_g -> (I, J)
     x_nu_sigma = jnp.sum(
@@ -39,11 +49,15 @@ def _v_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix):
         axis=-1,
     )
 
-    # V_ij = delta_j + random part
-    V_ij = delta.reshape(1, J) + x_nu_sigma  # (I, J)
+    # Mean utility: delta_j for inside goods, xi_t for outside good
+    # Build (J, T) delta matrix
+    delta_jt = jnp.concatenate([
+        jnp.broadcast_to(delta_inside[:, None], (J_in, T)),
+        xi[None, :],
+    ], axis=0)  # (J, T)
 
-    # Add market FEs: V_ijt = V_ij + xi_t
-    V_ijt = V_ij[:, :, None] + xi[None, None, :]  # (I, J, T)
+    # V_ijt = delta_jt + RC interaction
+    V_ijt = delta_jt[None, :, :] + x_nu_sigma[:, :, None]  # (I, J, T)
 
     # Mask unavailable products
     V_ijt = jnp.where(availability_matrix[None, :, :], V_ijt, UTILITY_PUNISH)
@@ -52,28 +66,30 @@ def _v_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix):
 
 
 @jax.jit
-def _s_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix):
+def _s_ijt(delta_inside, sigma, xi, x_jg, nu_i, availability_matrix):
     """Individual choice probabilities. Shape (I, J, T)."""
-    V_ijt = _v_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix)
+    V_ijt = _v_ijt(delta_inside, sigma, xi, x_jg, nu_i, availability_matrix)
     return jax.nn.softmax(V_ijt, axis=1)
 
 
 @jax.jit
-def _s_jt(delta, sigma, xi, x_jg, nu_i, w_i, availability_matrix):
+def _s_jt(delta_inside, sigma, xi, x_jg, nu_i, w_i, availability_matrix):
     """Market shares (integrated over individuals). Shape (J, T)."""
-    S_ijt = _s_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix)
+    S_ijt = _s_ijt(delta_inside, sigma, xi, x_jg, nu_i, availability_matrix)
     I = w_i.shape[0]
     return jnp.sum(w_i.reshape(I, 1, 1) * S_ijt, axis=0)
 
 
 @jax.jit
-def _diversion_jk(delta, sigma, xi, x_jg, nu_i, w_i, availability_matrix_full):
-    """Diversion D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ]. Shape (J, J)."""
-    S_ijt = _s_ijt(delta, sigma, xi, x_jg, nu_i, availability_matrix_full)
+def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full):
+    """Diversion D_jk at xi=0. Shape (J, J)."""
+    T = availability_matrix_full.shape[1]
+    xi_zero = jnp.zeros(T)
+    S_ijt = _s_ijt(delta_inside, sigma, xi_zero, x_jg, nu_i, availability_matrix_full)
     I = w_i.shape[0]
     S_jt = jnp.sum(w_i.reshape(I, 1, 1) * S_ijt, axis=0)
 
-    # Use market 0 (all markets identical under full availability)
+    # Use market 0 (all markets identical at xi=0 under full availability)
     S_ij = S_ijt[:, :, 0]  # (I, J)
     S_j = S_jt[:, 0]       # (J,)
 
@@ -127,22 +143,23 @@ class RandomCoefficients(DiscreteChoiceModel):
         print(f"{'G (Random Coeffs):':<{w}} {self.G}")
 
     def _unpack_theta(self, theta):
-        delta = jnp.concatenate([theta[: self.J - 1], jnp.array([0.0])])
+        delta_inside = theta[:self.J - 1]
+        delta = jnp.concatenate([delta_inside, jnp.array([0.0])])
         sigma = theta[self.J - 1 : self.J - 1 + self.G]
         if self.market_fe:
             xi = jnp.concatenate([theta[self.J - 1 + self.G :], jnp.array([0.0])])
         else:
             xi = jnp.zeros(self.T)
-        return {"delta": delta, "sigma": sigma, "xi": xi}
+        return {"delta": delta, "delta_inside": delta_inside, "sigma": sigma, "xi": xi}
 
     def _compute_shares(self, theta, avail):
         p = self._unpack_theta(theta)
-        return _s_jt(p["delta"], p["sigma"], p["xi"],
+        return _s_jt(p["delta_inside"], p["sigma"], p["xi"],
                       self.x2, self.nu_i, self.w_i, avail)
 
     def _compute_diversion(self, theta):
         p = self._unpack_theta(theta)
-        return _diversion_jk(p["delta"], p["sigma"], p["xi"],
+        return _diversion_jk(p["delta_inside"], p["sigma"],
                               self.x2, self.nu_i, self.w_i,
                               self._availability_matrix_full)
 
@@ -150,7 +167,7 @@ class RandomCoefficients(DiscreteChoiceModel):
         delta = rng.uniform(-5, -3, self.J - 1)
         sigma = rng.uniform(0, 1, self.G)
         if self.market_fe:
-            xi = rng.uniform(-10, 10, self.T - 1)
+            xi = rng.uniform(-1, 1, self.T - 1)
             return jnp.array(np.concatenate([delta, sigma, xi]))
         else:
             return jnp.array(np.concatenate([delta, sigma]))
@@ -165,43 +182,37 @@ class RandomCoefficients(DiscreteChoiceModel):
             return delta_b + sigma_b
 
     def _compute_jacobian(self, theta):
-        """∂s_j/∂δ_k = E_i[w_i · s_ik · (1_{j=k} - s_ij)]. Shape (J, J)."""
+        """∂s_j/∂δ_k at xi=0. Shape (J, J)."""
         p = self._unpack_theta(theta)
-        S_ijt = _s_ijt(p["delta"], p["sigma"], p["xi"],
+        xi_zero = jnp.zeros(self.T)
+        S_ijt = _s_ijt(p["delta_inside"], p["sigma"], xi_zero,
                         self.x2, self.nu_i, self._availability_matrix_full)
         S_ij = S_ijt[:, :, 0]  # (I, J)
-        I, J = S_ij.shape
-        # E_i[w_i * (diag(s_i) - s_i s_i^T)]
-        # = sum_i w_i * diag(s_i) - sum_i w_i * outer(s_i, s_i)
-        w = self.w_i  # (I,)
-        weighted_diag = jnp.sum(w[:, None] * S_ij, axis=0)       # (J,)
-        weighted_outer = jnp.einsum("i,ij,ik->jk", w, S_ij, S_ij)  # (J, J)
+        w = self.w_i
+        weighted_diag = jnp.sum(w[:, None] * S_ij, axis=0)
+        weighted_outer = jnp.einsum("i,ij,ik->jk", w, S_ij, S_ij)
         return jnp.diag(weighted_diag) - weighted_outer
 
     def _compute_elasticity(self, theta, prices, price_coeff, price_col):
-        """Price elasticity with heterogeneous price coefficients.
+        """Price elasticity at xi=0 with heterogeneous price coefficients.
 
-        β_i^p = price_coeff + σ_{price_col} · ν_i[price_col]
-
-        η_jk = (p_k / s_j) · E_i[w_i · β_i^p · s_ik · (1_{j=k} - s_ij)]
+        beta_i^p = price_coeff + sigma[price_col] * nu_i[price_col]
         """
         p = self._unpack_theta(theta)
-        S_ijt = _s_ijt(p["delta"], p["sigma"], p["xi"],
+        xi_zero = jnp.zeros(self.T)
+        S_ijt = _s_ijt(p["delta_inside"], p["sigma"], xi_zero,
                         self.x2, self.nu_i, self._availability_matrix_full)
-        S_ij = S_ijt[:, :, 0]  # (I, J)
-        s_j = jnp.sum(self.w_i[:, None] * S_ij, axis=0)  # (J,)
+        S_ij = S_ijt[:, :, 0]
+        s_j = jnp.sum(self.w_i[:, None] * S_ij, axis=0)
 
-        # Individual-level price coefficient
         if price_col is not None:
-            beta_i = price_coeff + p["sigma"][price_col] * self.nu_i[:, price_col]  # (I,)
+            beta_i = price_coeff + p["sigma"][price_col] * self.nu_i[:, price_col]
         else:
-            beta_i = jnp.full(self.I, price_coeff)  # (I,)
+            beta_i = jnp.full(self.I, price_coeff)
 
-        # E_i[w_i · β_i · (diag(s_i) - s_i s_i^T)]
-        wb = self.w_i * beta_i  # (I,)
-        weighted_diag = jnp.sum(wb[:, None] * S_ij, axis=0)          # (J,)
-        weighted_outer = jnp.einsum("i,ij,ik->jk", wb, S_ij, S_ij)  # (J, J)
-        jac_price = jnp.diag(weighted_diag) - weighted_outer         # (J, J)
+        wb = self.w_i * beta_i
+        weighted_diag = jnp.sum(wb[:, None] * S_ij, axis=0)
+        weighted_outer = jnp.einsum("i,ij,ik->jk", wb, S_ij, S_ij)
+        jac_price = jnp.diag(weighted_diag) - weighted_outer
 
-        # η_jk = p_k · jac_price_jk / s_j
         return prices[None, :] * jac_price / s_j[:, None]
