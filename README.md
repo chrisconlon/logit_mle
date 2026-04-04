@@ -5,9 +5,15 @@ JAX-based maximum likelihood estimation for discrete choice models: Logit, Neste
 ## Installation
 
 ```bash
-uv pip install -e .
+# From GitHub
+uv pip install "logit_mle @ git+https://github.com/chrisconlon/logit_mle.git"
 
-# With sparse grid support (adds chaospy dependency):
+# With sparse grid support (adds chaospy dependency)
+uv pip install "logit_mle[sparse] @ git+https://github.com/chrisconlon/logit_mle.git"
+
+# For development (editable install from local clone)
+git clone https://github.com/chrisconlon/logit_mle.git
+cd logit_mle
 uv pip install -e ".[sparse]"
 ```
 
