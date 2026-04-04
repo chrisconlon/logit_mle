@@ -42,9 +42,9 @@ result = model.fit(seed=2025)
 D = model.diversion_matrix(result.x)
 ```
 
-**Parameters:** `theta = delta[J-1]` (mean utility; outside good normalized to 0).
+**Parameters:** `theta = delta[J-1]` (mean utility; outside good normalized to 0). With `market_fe=True`: `theta = (delta[J-1], xi[T-1])`.
 
-**Diversion:** Closed-form IIA formula `D_jk = s_k / (1 - s_j)`.
+**Diversion:** Closed-form IIA formula `D_jk = s_k / (1 - s_j)`, evaluated at xi=0.
 
 ### Nested Logit
 
@@ -58,7 +58,7 @@ result = model.fit(seed=2025)
 D = model.diversion_matrix(result.x)
 ```
 
-**Parameters:** `theta = (delta[J-1], sigma)` where `sigma` is Train's nesting parameter (Berry/Cardell `rho = 1 - sigma`).
+**Parameters:** `theta = (delta[J-1], sigma)` where `sigma` is Train's nesting parameter (Berry/Cardell `rho = 1 - sigma`). With `market_fe=True`: `theta = (delta[J-1], sigma, xi[T-1])`.
 
 **Constructor:** `nesting_ids` is a `(J-1,)` integer array assigning each inside good to a nest. The outside good is automatically placed in its own singleton nest.
 
@@ -99,7 +99,28 @@ where `G` is the number of random coefficient characteristics.
 - `w_i`: `(I,)` integration weights
 - `market_fe`: if `True`, includes market fixed effects (RCC); default `False` (RCN)
 
-**Diversion:** Integrated over individuals: `D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ]`.
+**Diversion:** Integrated over individuals: `D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ]`, evaluated at xi=0.
+
+## Market fixed effects
+
+All models support `market_fe=True`, which adds market-varying outside good utility `xi_t` (Berry 1994). This captures market-level variation in the attractiveness of not purchasing.
+
+```python
+# Logit with market FE
+model = Logit(availability_matrix, q_jt, market_fe=True)
+# theta = (delta[J-1], xi[T-1])
+
+# NL with market FE
+model = NestedLogit(availability_matrix, q_jt, nesting_ids=ids, market_fe=True)
+# theta = (delta[J-1], sigma, xi[T-1])
+
+# RCC with market FE
+model = RandomCoefficients(availability_matrix, q_jt,
+                           x2=x_jg, nu_i=nu_i, w_i=w_i, market_fe=True)
+# theta = (delta[J-1], sigma[G], xi[T-1])
+```
+
+The last market is the normalization (`xi[T-1] = 0`). Diversion, Jacobian, and elasticity are always evaluated at `xi = 0` (structural, market-invariant).
 
 ## Elasticities
 
