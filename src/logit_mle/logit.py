@@ -94,6 +94,13 @@ class Logit(DiscreteChoiceModel):
             bounds += [(-30, 30)] * (self.T - 1)
         return bounds
 
+    def _theta_with_zero_xi(self, theta):
+        """Replace ξ entries in theta with zero (ξ=0 baseline evaluation)."""
+        if not self.market_fe:
+            return theta
+        # theta layout: (delta[J-1], xi[T-1])
+        return jnp.concatenate([theta[:self.J - 1], jnp.zeros(self.T - 1)])
+
     def _compute_jacobian(self, theta):
         """Closed-form Jacobian at xi=0: ∂s_j/∂δ_k = s_k(1_{j=k} - s_j)."""
         p = self._unpack_theta(theta)

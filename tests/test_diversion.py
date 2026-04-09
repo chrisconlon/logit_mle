@@ -59,8 +59,7 @@ def make_nested_logit(J_per_nest=4, G=3, rho_cardell=0.5, seed=42):
     avail = np.ones((J, 1), dtype=bool)
 
     deltas = rng.randn(J_in) * 0.5
-    sigma_train = 1.0 - rho_cardell
-    theta = jnp.array(np.concatenate([deltas, [sigma_train]]))
+    theta = jnp.array(np.concatenate([deltas, [rho_cardell]]))
 
     model = NestedLogit(avail, nesting_ids=nesting_ids)
     return model, theta, J
@@ -153,7 +152,7 @@ class TestNestedLogitDiversion:
             err_msg=f"NL (rho={rho}): rows should sum to 1")
 
     def test_reduces_to_logit_at_rho_zero(self):
-        """When rho=0 (sigma=1), NL diversion = logit diversion = s_k/(1-s_j)."""
+        """When rho=0 (Berry/Cardell), NL diversion = logit IIA = s_k/(1-s_j)."""
         model, theta, J = make_nested_logit(rho_cardell=0.0)
         s = np.array(model.shares(theta)[:, 0])
         D = np.array(model.diversion_matrix(theta))

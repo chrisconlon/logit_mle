@@ -1,22 +1,37 @@
 """
 Nested Logit discrete choice model.
 
-Parameters:
+Public API parameters:
   - delta[J-1]: mean utility for inside goods (outside good normalized to 0)
-  - sigma:      Train's nesting parameter in (0, 1); Berry/Cardell rho = 1 - sigma
+  - rho:        Berry/Cardell nesting parameter in [0, 1).
+                rho = 0 collapses to plain logit; rho -> 1 is full within-nest
+                correlation.
   - xi[T-1]:    outside good's mean utility per market (only if market_fe=True;
                 last market normalized to 0)
 
 Constructor takes nesting_ids (J-1,) integer vector for inside goods.
 The outside good is automatically placed in its own singleton nest.
 
+Share formulas (Berry/Cardell):
+  s_{j|g} = exp(delta_j / (1 - rho)) / D_g
+  s_g     = D_g^(1 - rho) / sum_g' D_g'^(1 - rho)
+  D_g     = sum_{k in J_g} exp(delta_k / (1 - rho))
+
+Internally, the optimizer reparameterizes via gamma = delta / (1 - rho), which
+removes 1/(1 - rho) from the inner exponentials and decouples the rho/delta
+cross-partial. This makes the (negative) log-likelihood much smoother and the
+optimization markedly more robust to starting values. The substitution is
+transparent to the user: theta is passed and returned in (delta, rho, xi)
+form everywhere.
+
 Diversion: closed-form formula from the paper appendix (tau_in/tau_out),
-evaluated at xi=0 (structural diversion).
-A vmap product-removal method is also available for testing.
+evaluated at the xi=0 baseline. A vmap product-removal method is
+also available for testing.
 """
 from __future__ import annotations
 
 import numpy as np
+import scipy as sp
 import jax
 import jax.numpy as jnp
 
@@ -27,181 +42,127 @@ from .base import DiscreteChoiceModel
 UTILITY_PUNISH = -1e20
 
 
-# ── JAX computation functions (importable for tests) ─────────────
+# ── JAX share / diversion functions in (gamma, rho) form ─────────
 #
-# These work with a "core" theta = (delta[J-1], sigma) that has no xi.
-# The outside good's utility is always 0 in these functions.
-# The class handles xi by building a delta vector where delta[J-1] = xi_t.
+# These take gamma = delta / (1 - rho) and rho directly. The outside-good
+# entries of gamma are passed in via gamma_xi (a length-T vector when there
+# are market fixed effects, or a length-T vector of zeros otherwise).
 
-def compute_v_gjt(theta, nest_matrix, availability_matrix):
-    """Deterministic utility per nest. Shape (G, J, T).
 
-    theta = (delta[J-1], sigma). nest_matrix is (G, J) bool.
+def _shares_from_gamma(gamma_inside, rho, gamma_xi, nest_matrix, availability_matrix):
+    """Shares (J, T) under (gamma, rho) parameterization.
+
+    gamma_inside : (J-1,) inside-good gamma values
+    rho          : scalar nesting parameter (Berry/Cardell)
+    gamma_xi     : (T,) outside-good gamma values per market
+                   (set last entry to 0 to apply normalization)
     """
-    delta = jnp.concatenate([theta[:-1], jnp.array([0.0])])
-    G, J = nest_matrix.shape
+    J_in = gamma_inside.shape[0]
+    J = J_in + 1
     T = availability_matrix.shape[1]
+    G = nest_matrix.shape[0]
 
-    delta_reshape = delta.reshape(1, J)
-    vgj_nest = jnp.where(nest_matrix, delta_reshape, UTILITY_PUNISH)
+    gamma_inside_full = jnp.broadcast_to(gamma_inside[:, None], (J_in, T))
+    gamma_full = jnp.concatenate([gamma_inside_full, gamma_xi[None, :]], axis=0)
 
-    vgjt_nest = vgj_nest.reshape(G, J, 1)
-    V_gjt = jnp.where(availability_matrix.reshape(1, J, T), vgjt_nest, UTILITY_PUNISH)
-    return V_gjt
+    nm = nest_matrix[:, :, None]                          # (G, J, 1)
+    av = availability_matrix.astype(bool)[None, :, :]     # (1, J, T)
+    g_jt = gamma_full[None, :, :]                         # (1, J, T)
+    V_gjt = jnp.where(nm & av, g_jt, UTILITY_PUNISH)
+
+    IV_gt = jax.nn.logsumexp(V_gjt, axis=1)            # log D_g, (G, T)
+    s_gjt = jax.nn.softmax(V_gjt, axis=1)              # conditional within nest
+    s_gt = jax.nn.softmax(IV_gt * (1.0 - rho), axis=0) # nest share
+    s_jt = (s_gjt * s_gt[:, None, :]).sum(axis=0)
+    return s_jt
 
 
-def _compute_v_gjt_with_delta(delta_full, sigma, nest_matrix, availability_matrix):
-    """Like compute_v_gjt but takes full delta vector directly (for market-varying delta)."""
-    G, J = nest_matrix.shape
+def _shares_decomposition_from_gamma(gamma_inside, rho, gamma_xi,
+                                     nest_matrix, availability_matrix):
+    """Like _shares_from_gamma but also returns (S_gjt, S_gt, S_jt)."""
+    J_in = gamma_inside.shape[0]
     T = availability_matrix.shape[1]
+    G = nest_matrix.shape[0]
 
-    delta_reshape = delta_full.reshape(1, J)
-    vgj_nest = jnp.where(nest_matrix, delta_reshape, UTILITY_PUNISH)
+    gamma_inside_full = jnp.broadcast_to(gamma_inside[:, None], (J_in, T))
+    gamma_full = jnp.concatenate([gamma_inside_full, gamma_xi[None, :]], axis=0)
 
-    vgjt_nest = vgj_nest.reshape(G, J, 1)
-    V_gjt = jnp.where(availability_matrix.reshape(1, J, T), vgjt_nest, UTILITY_PUNISH)
-    return V_gjt
+    nm = nest_matrix[:, :, None]
+    av = availability_matrix.astype(bool)[None, :, :]
+    g_jt = gamma_full[None, :, :]
+    V_gjt = jnp.where(nm & av, g_jt, UTILITY_PUNISH)
 
-
-def compute_iv_gt(theta, V_gjt):
-    """Inclusive value per nest. Shape (G, T)."""
-    rho = theta[-1]
-    return jax.nn.logsumexp(V_gjt / rho, axis=1)
-
-
-def compute_s_gjt(theta, V_gjt):
-    """Conditional share of j given nest g. Shape (G, J, T)."""
-    rho = theta[-1]
-    return jax.nn.softmax(V_gjt / rho, axis=1)
+    IV_gt = jax.nn.logsumexp(V_gjt, axis=1)
+    s_gjt = jax.nn.softmax(V_gjt, axis=1)
+    s_gt = jax.nn.softmax(IV_gt * (1.0 - rho), axis=0)
+    s_jt = (s_gjt * s_gt[:, None, :]).sum(axis=0)
+    return s_gjt, s_gt, s_jt
 
 
-def compute_s_gt(theta, IV_gt):
-    """Nest share. Shape (G, T)."""
-    rho = theta[-1]
-    return jax.nn.softmax(IV_gt * rho, axis=0)
+def _diversion_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full):
+    """Closed-form diversion at xi=0 under full availability. Shape (J, J)."""
+    J_in = gamma_inside.shape[0]
+    J = J_in + 1
+    T = availability_matrix_full.shape[1]
 
+    gamma_xi_zero = jnp.zeros(T)
+    s_gjt, s_gt, s_jt = _shares_decomposition_from_gamma(
+        gamma_inside, rho, gamma_xi_zero, nest_matrix, availability_matrix_full
+    )
 
-def compute_s_jt(theta, S_gjt, S_gt):
-    """Unconditional market shares. Shape (J, T)."""
-    G, T = S_gt.shape
-    S_jt = S_gjt * S_gt.reshape(G, 1, T)
-    return S_jt.sum(axis=0)
+    s_gj = s_gjt[:, :, 0]   # (G, J)
+    s_g = s_gt[:, 0]        # (G,)
+    s_j = s_jt[:, 0]        # (J,)
 
-
-def _shares_pipeline(theta, nest_matrix, availability_matrix):
-    """Full share computation pipeline. Returns (S_gjt, S_gt, S_jt)."""
-    V_gjt = compute_v_gjt(theta, nest_matrix, availability_matrix)
-    IV_gt = compute_iv_gt(theta, V_gjt)
-    S_gjt = compute_s_gjt(theta, V_gjt)
-    S_gt = compute_s_gt(theta, IV_gt)
-    S_jt = compute_s_jt(theta, S_gjt, S_gt)
-    return S_gjt, S_gt, S_jt
-
-
-def _shares_pipeline_delta(delta_full, sigma, nest_matrix, availability_matrix):
-    """Share pipeline taking delta vector directly (for market-varying outside good)."""
-    V_gjt = _compute_v_gjt_with_delta(delta_full, sigma, nest_matrix, availability_matrix)
-    IV_gt = jax.nn.logsumexp(V_gjt / sigma, axis=1)
-    S_gjt = jax.nn.softmax(V_gjt / sigma, axis=1)
-    S_gt = jax.nn.softmax(IV_gt * sigma, axis=0)
-    S_jt = (S_gjt * S_gt.reshape(S_gt.shape[0], 1, S_gt.shape[1])).sum(axis=0)
-    return S_gjt, S_gt, S_jt
-
-
-def _shares_mfe(delta_inside, sigma, xi, nest_matrix, availability_matrix):
-    """Shares with market-varying outside good utility. Shape (J, T).
-
-    Computes shares market-by-market with delta[J-1] = xi_t.
-    """
-    J_in = delta_inside.shape[0]
-    T = availability_matrix.shape[1]
-
-    def shares_at_t(xi_t, avail_t):
-        delta_full = jnp.concatenate([delta_inside, jnp.array([xi_t])])
-        _, _, s_jt = _shares_pipeline_delta(delta_full, sigma, nest_matrix, avail_t[:, None])
-        return s_jt[:, 0]
-
-    # vmap over (xi_t, avail columns)
-    return jax.vmap(shares_at_t, in_axes=(0, 1), out_axes=1)(xi, availability_matrix)  # (J, T)
-
-
-def _diversion_from_formula(theta, nest_matrix, availability_matrix_full):
-    """Closed-form diversion for nested logit at xi=0. Shape (J, J).
-
-    Uses Berry/Cardell rho = 1 - sigma notation internally.
-    Computed under full availability at t=0.
-    """
-    S_gjt, S_gt, S_jt = _shares_pipeline(theta, nest_matrix, availability_matrix_full)
-
-    s_gj = S_gjt[:, :, 0]  # (G, J)
-    s_g = S_gt[:, 0]       # (G,)
-    s_j = S_jt[:, 0]       # (J,)
-
-    G, J = s_gj.shape
-    J_in = J - 1
     inside = jnp.arange(J_in)
-
-    rho = 1.0 - theta[-1]  # Berry/Cardell
-
-    # Nest assignment for each product
-    g_of_all = jnp.argmax(nest_matrix.astype(jnp.int32), axis=0)  # (J,)
+    g_of_all = jnp.argmax(nest_matrix.astype(jnp.int32), axis=0)
     g_of_in = g_of_all[:J_in]
 
-    # Conditional share s_{j|g(j)} and nest share s_{g(j)} for inside goods
     sgj = s_gj[g_of_in, inside]
     sg = s_g[g_of_in]
 
-    # K_j, a_j, b_j terms
+    # K_j = (1 - s_g) + s_g * (1 - s_{j|g})^{1-rho}
     DELTA = (1.0 - sg) + sg * (1.0 - sgj) ** (1.0 - rho)
-    aj = 1.0 / DELTA - 1.0
-    cj = 1.0 / (DELTA * (1.0 - sgj) ** rho) - 1.0
+    aj = 1.0 / DELTA - 1.0                                # tau_out - 1
+    cj = 1.0 / (DELTA * (1.0 - sgj) ** rho) - 1.0         # tau_in - 1
     bj = cj - aj
 
-    # Same-nest indicator
     M = (g_of_in[:, None] == g_of_all[None, :]).astype(s_j.dtype)  # (J_in, J)
+    ratio = s_j[None, :] / s_j[:J_in][:, None]                     # (J_in, J)
 
-    # Ratio s_k / s_j
-    ratio = s_j[None, :] / s_j[:J_in][:, None]  # (J_in, J)
-
-    # Inside rows + outside row
-    D_in = ratio * (aj[:, None] + bj[:, None] * M)  # (J_in, J)
-    D_0 = (s_j / (1.0 - s_j[-1]))[None, :]         # (1, J)
-    D = jnp.vstack([D_in, D_0])                     # (J, J)
-
+    D_in = ratio * (aj[:, None] + bj[:, None] * M)                 # (J_in, J)
+    D_0 = (s_j / (1.0 - s_j[-1]))[None, :]                         # (1, J)
+    D = jnp.vstack([D_in, D_0])
     return D
 
 
-def _diversion_vmap(theta, nest_matrix, availability_matrix_full):
-    """Simulation-based diversion via vmap product removal at xi=0. Shape (J, J, T).
+def _diversion_vmap_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full):
+    """Simulation-based diversion via vmap product removal at xi=0.
 
-    Slower than the formula but useful for testing.
+    Slower than the closed form -- mainly for testing.
     """
     J, T = availability_matrix_full.shape
+    gamma_xi_zero = jnp.zeros(T)
 
-    V_gjt = compute_v_gjt(theta, nest_matrix, availability_matrix_full)
-    IV_gt = compute_iv_gt(theta, V_gjt)
-    S_gjt = compute_s_gjt(theta, V_gjt)
-    S_gt = compute_s_gt(theta, IV_gt)
-    S_jt = compute_s_jt(theta, S_gjt, S_gt)
+    s_jt = _shares_from_gamma(
+        gamma_inside, rho, gamma_xi_zero, nest_matrix, availability_matrix_full
+    )
 
     def shares_with_j_removed(j):
         new_avail = availability_matrix_full.at[j, :].set(False)
-        V = compute_v_gjt(theta, nest_matrix, new_avail)
-        IV = compute_iv_gt(theta, V)
-        Sg = compute_s_gjt(theta, V)
-        Sn = compute_s_gt(theta, IV)
-        return compute_s_jt(theta, Sg, Sn)
+        return _shares_from_gamma(
+            gamma_inside, rho, gamma_xi_zero, nest_matrix, new_avail
+        )
 
     S_rjt = jax.vmap(shares_with_j_removed)(jnp.arange(J))
 
-    numer = S_rjt - S_jt[None, :, :]
-    denom = S_jt[:, None, :]
+    numer = S_rjt - s_jt[None, :, :]
+    denom = s_jt[:, None, :]
     D_jkt = numer / denom
 
     row_idx, col_idx = jnp.diag_indices(J)
     D_jkt = D_jkt.at[row_idx, col_idx, :].set(0.0)
     D_jkt = jnp.nan_to_num(D_jkt, nan=0.0)
-
     return D_jkt
 
 
@@ -209,6 +170,9 @@ def _diversion_vmap(theta, nest_matrix, availability_matrix_full):
 
 class NestedLogit(DiscreteChoiceModel):
     """Nested logit model.
+
+    Public theta layout: ``(delta[J-1], rho, xi[T-1])`` if ``market_fe=True``,
+    else ``(delta[J-1], rho)``.
 
     Parameters
     ----------
@@ -247,7 +211,6 @@ class NestedLogit(DiscreteChoiceModel):
         unique_nests = np.unique(nesting_ids)
         G = len(unique_nests)
 
-        # Map nest labels to contiguous 0..G-1
         nest_map = {int(n): i for i, n in enumerate(unique_nests)}
 
         mat = np.zeros((G + 1, self.J), dtype=bool)
@@ -264,76 +227,233 @@ class NestedLogit(DiscreteChoiceModel):
         print(f"{'T (Markets):':<{w}} {self.T}")
         print(f"{'G (Nests):':<{w}} {self.G}")
 
+    # ── Theta packing in user (delta) form ───────────────────────
+
     def _unpack_theta(self, theta):
+        """Split user-form theta = (delta[J-1], rho, xi[T-1])."""
         delta_inside = theta[:self.J - 1]
         delta = jnp.concatenate([delta_inside, jnp.array([0.0])])
-        sigma = theta[self.J - 1]
+        rho = theta[self.J - 1]
         if self.market_fe:
-            xi = jnp.concatenate([theta[self.J:], jnp.array([0.0])])
+            xi_inside = theta[self.J:]
+            xi = jnp.concatenate([xi_inside, jnp.array([0.0])])
         else:
             xi = jnp.zeros(self.T)
-        return {"delta": delta, "delta_inside": delta_inside, "sigma": sigma, "xi": xi}
+        return {
+            "delta": delta,
+            "delta_inside": delta_inside,
+            "rho": rho,
+            "xi": xi,
+        }
 
-    def _core_theta(self, theta):
-        """Build (delta[J-1], sigma) for the free functions (no xi)."""
-        return jnp.concatenate([theta[:self.J - 1], theta[self.J - 1:self.J]])
+    def _delta_theta_to_gamma(self, theta):
+        """Convert user-form (delta, rho, xi) -> internal (gamma, rho, gamma_xi).
+
+        gamma = delta / (1 - rho); gamma_xi = xi / (1 - rho).
+        """
+        p = self._unpack_theta(theta)
+        rho = p["rho"]
+        gamma_inside = p["delta_inside"] / (1.0 - rho)
+        if self.market_fe:
+            xi_inside = theta[self.J:]
+            gamma_xi_inside = xi_inside / (1.0 - rho)
+            return jnp.concatenate(
+                [gamma_inside, jnp.array([rho]), gamma_xi_inside]
+            )
+        return jnp.concatenate([gamma_inside, jnp.array([rho])])
+
+    def _gamma_theta_to_delta(self, theta_gamma):
+        """Convert internal (gamma, rho, gamma_xi) -> user-form (delta, rho, xi)."""
+        gamma_inside = theta_gamma[:self.J - 1]
+        rho = theta_gamma[self.J - 1]
+        delta_inside = gamma_inside * (1.0 - rho)
+        if self.market_fe:
+            gamma_xi_inside = theta_gamma[self.J:]
+            xi_inside = gamma_xi_inside * (1.0 - rho)
+            return jnp.concatenate([delta_inside, jnp.array([rho]), xi_inside])
+        return jnp.concatenate([delta_inside, jnp.array([rho])])
+
+    # ── Share / diversion (user-form theta) ──────────────────────
+
+    def _gamma_components(self, theta):
+        """Return (gamma_inside, rho, gamma_xi) given user-form theta."""
+        p = self._unpack_theta(theta)
+        rho = p["rho"]
+        gamma_inside = p["delta_inside"] / (1.0 - rho)
+        gamma_xi = p["xi"] / (1.0 - rho)  # length T, last entry is 0
+        return gamma_inside, rho, gamma_xi
 
     def _compute_shares(self, theta, avail):
-        p = self._unpack_theta(theta)
-        if self.market_fe:
-            return _shares_mfe(p["delta_inside"], p["sigma"], p["xi"],
-                               self.nest_matrix, avail)
-        else:
-            core = self._core_theta(theta)
-            _, _, S_jt = _shares_pipeline(core, self.nest_matrix, avail)
-            return S_jt
+        gamma_inside, rho, gamma_xi = self._gamma_components(theta)
+        return _shares_from_gamma(
+            gamma_inside, rho, gamma_xi, self.nest_matrix, avail
+        )
 
     def _compute_diversion(self, theta):
         """Closed-form diversion at xi=0 under full availability. Shape (J, J)."""
-        core = self._core_theta(theta)
-        return _diversion_from_formula(
-            core, self.nest_matrix, self._availability_matrix_full
+        gamma_inside, rho, _ = self._gamma_components(theta)
+        return _diversion_from_gamma(
+            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full
         )
 
+    # ── Starting values & bounds (user-form / delta-form) ────────
+
     def _make_x0(self, rng):
-        delta = rng.uniform(-10, 10, self.J - 1)
-        sigma = rng.uniform(0.01, 0.99)
+        """Starting values in user (delta) form."""
+        delta = rng.uniform(-3, 3, self.J - 1)
+        rho = rng.uniform(0.05, 0.5)
         if self.market_fe:
-            xi = rng.uniform(-1, 1, self.T - 1)
-            return jnp.array(np.concatenate([delta, [sigma], xi]))
-        return jnp.array(np.concatenate([delta, [sigma]]))
+            xi = rng.uniform(-0.5, 0.5, self.T - 1)
+            return jnp.array(np.concatenate([delta, [rho], xi]))
+        return jnp.array(np.concatenate([delta, [rho]]))
 
     def _theta_bounds(self):
+        """Bounds in user (delta) form. Used by base.fit() if it is ever called."""
         delta_b = [(-30, 30)] * (self.J - 1)
-        sigma_b = [(0.001, 0.999)]
+        rho_b = [(0.0, 0.999)]
         if self.market_fe:
             xi_b = [(-30, 30)] * (self.T - 1)
-            return delta_b + sigma_b + xi_b
-        return delta_b + sigma_b
+            return delta_b + rho_b + xi_b
+        return delta_b + rho_b
 
-    def _compute_jacobian(self, theta):
-        """∂s_j/∂δ_k at xi=0 under full availability, market 0. Shape (J, J)."""
-        p = self._unpack_theta(theta)
-        sigma = p["sigma"]
+    # ── Internal gamma-space starting values & bounds ────────────
+
+    def _make_x0_gamma(self, rng):
+        """Starting values in internal (gamma) form."""
+        gamma = rng.uniform(-3, 3, self.J - 1)
+        rho = rng.uniform(0.05, 0.5)
+        if self.market_fe:
+            gamma_xi = rng.uniform(-0.5, 0.5, self.T - 1)
+            return np.concatenate([gamma, [rho], gamma_xi])
+        return np.concatenate([gamma, [rho]])
+
+    def _gamma_bounds(self):
+        gamma_b = [(-50, 50)] * (self.J - 1)
+        rho_b = [(0.0, 0.999)]
+        if self.market_fe:
+            gamma_xi_b = [(-50, 50)] * (self.T - 1)
+            return gamma_b + rho_b + gamma_xi_b
+        return gamma_b + rho_b
+
+    # ── Custom fit() that optimizes in gamma-space ───────────────
+
+    def fit(
+        self,
+        *,
+        aug_div=False,
+        penalty=1e-4,
+        diversion_rows=None,
+        ftol=1e-14,
+        seed=2025,
+        verbose=True,
+    ):
+        """Maximum likelihood with internal gamma reparameterization.
+
+        Optimizes over gamma = delta / (1 - rho) for numerical stability,
+        then converts the solution back to (delta, rho, xi) before returning.
+        The returned ``result.x`` is in user (delta) form.
+        """
+        if self.q_jt is None:
+            raise ValueError("q_jt is required for fit()")
+        if aug_div and self._diversion_data is None:
+            raise ValueError("aug_div=True requires diversion_data")
+
+        rng = np.random.RandomState(seed)
+        x0_gamma = self._make_x0_gamma(rng)
+        bounds_gamma = self._gamma_bounds()
+
+        # Capture closure data for clean JIT
+        avail = self.availability_matrix
+        avail_full = self._availability_matrix_full
+        q_jt = self.q_jt
         nest_matrix = self.nest_matrix
-        avail = self._availability_matrix_full
+        J_in = self.J - 1
+        T = self.T
+        market_fe = self.market_fe
+        div_data = self._diversion_data
 
-        def shares_of_delta(delta_full):
-            G, J = nest_matrix.shape
-            T = avail.shape[1]
-            delta_reshape = delta_full.reshape(1, J)
-            vgj_nest = jnp.where(nest_matrix, delta_reshape, UTILITY_PUNISH)
-            vgjt_nest = vgj_nest.reshape(G, J, 1)
-            V_gjt = jnp.where(avail.reshape(1, J, T), vgjt_nest, UTILITY_PUNISH)
+        if aug_div:
+            if diversion_rows is None:
+                rows = jnp.arange(self.J)
+            else:
+                rows = jnp.array(diversion_rows)
+        else:
+            rows = None
 
-            IV_gt = jax.nn.logsumexp(V_gjt / sigma, axis=1)
-            S_gjt = jax.nn.softmax(V_gjt / sigma, axis=1)
-            S_gt = jax.nn.softmax(IV_gt * sigma, axis=0)
-            S_jt = (S_gjt * S_gt.reshape(G, 1, T)).sum(axis=0)
-            return S_jt[:, 0]
+        def objective_gamma(theta_gamma):
+            gamma_inside = theta_gamma[:J_in]
+            rho = theta_gamma[J_in]
+            if market_fe:
+                gamma_xi_inside = theta_gamma[J_in + 1:]
+                gamma_xi = jnp.concatenate(
+                    [gamma_xi_inside, jnp.array([0.0])]
+                )
+            else:
+                gamma_xi = jnp.zeros(T)
 
-        delta = jnp.concatenate([theta[:self.J - 1], jnp.array([0.0])])
-        return jax.jacobian(shares_of_delta)(delta)
+            s_jt = _shares_from_gamma(
+                gamma_inside, rho, gamma_xi, nest_matrix, avail
+            )
+            s_jt_safe = jnp.where(s_jt == 0, 1.0, s_jt)
+            model_ll = jnp.sum(q_jt * jnp.log(s_jt_safe))
+
+            if not aug_div:
+                return -model_ll
+
+            D_jk = _diversion_from_gamma(
+                gamma_inside, rho, nest_matrix, avail_full
+            )
+            D_jk = D_jk.at[jnp.diag_indices_from(D_jk)].set(0.0)
+            D_jk_safe = jnp.where(D_jk == 0, 1.0, D_jk)
+            div_ll = jnp.sum(
+                div_data[rows, :] * jnp.log(D_jk_safe[rows, :])
+            )
+            return -(penalty * model_ll + div_ll)
+
+        jit_obj = jax.jit(objective_gamma)
+        jit_grad = jax.jit(jax.grad(objective_gamma))
+
+        if verbose:
+            def callback(x):
+                ll = jit_obj(x)
+                gn = jnp.linalg.norm(jit_grad(x))
+                print(f"Likelihood: {ll:.6f}  ||grad||: {gn:.6e}")
+        else:
+            callback = None
+
+        if verbose:
+            print(f"Starting MLE (NestedLogit, dim={len(x0_gamma)}, "
+                  f"aug_div={aug_div}, gamma-space)")
+            ll0 = jit_obj(x0_gamma)
+            gn0 = jnp.linalg.norm(jit_grad(x0_gamma))
+            print(f"Likelihood at x0: {ll0:.6f}  ||grad||: {gn0:.6e}")
+
+        result = sp.optimize.minimize(
+            jit_obj,
+            x0_gamma,
+            method="L-BFGS-B",
+            jac=jit_grad,
+            bounds=bounds_gamma,
+            callback=callback,
+            options={"disp": verbose, "ftol": ftol, "maxfun": 1_000_000},
+        )
+
+        # Convert result.x from gamma form back to delta form
+        result.x = np.asarray(self._gamma_theta_to_delta(jnp.array(result.x)))
+        return result
+
+    def _theta_with_zero_xi(self, theta):
+        """Replace ξ entries in theta with zero (ξ=0 baseline evaluation)."""
+        if not self.market_fe:
+            return theta
+        # theta layout: (delta[J-1], rho, xi[T-1])
+        return jnp.concatenate([theta[:self.J], jnp.zeros(self.T - 1)])
+
+    # NestedLogit inherits the base class _compute_jacobian (autodiff through
+    # _compute_shares with the constant-shift invariance for the outside-good
+    # column, and ξ zeroed via the _theta_with_zero_xi hook above). The internal
+    # gamma reparameterization is handled inside _compute_shares; the chain rule
+    # produces the correct ∂s_j/∂δ_k.
 
     # ── NL-specific public methods ───────────────────────────────
 
@@ -345,23 +465,14 @@ class NestedLogit(DiscreteChoiceModel):
         - S_jt:  (J, T)    -- unconditional shares
         """
         theta = jnp.asarray(theta)
-        if self.market_fe:
-            p = self._unpack_theta(theta)
-            # For decomposition, compute market-by-market
-            # Return full availability version at xi=0 for simplicity
-            core = self._core_theta(theta)
-            return _shares_pipeline(core, self.nest_matrix, self.availability_matrix)
-        else:
-            core = self._core_theta(theta)
-            return _shares_pipeline(core, self.nest_matrix, self.availability_matrix)
+        gamma_inside, rho, gamma_xi = self._gamma_components(theta)
+        return _shares_decomposition_from_gamma(
+            gamma_inside, rho, gamma_xi, self.nest_matrix, self.availability_matrix
+        )
 
     def compute_diversion_matrix_from_formula(self, theta):
-        """Closed-form diversion at xi=0. Shape (J, J). Alias for diversion_matrix()."""
-        theta = jnp.asarray(theta)
-        core = self._core_theta(theta)
-        return _diversion_from_formula(
-            core, self.nest_matrix, self._availability_matrix_full
-        )
+        """Closed-form diversion at xi=0. Alias for diversion_matrix()."""
+        return self.diversion_matrix(theta)
 
     def compute_diversion_matrix_vmap(self, theta):
         """Simulation-based diversion via product removal at xi=0. Shape (J, J).
@@ -370,8 +481,22 @@ class NestedLogit(DiscreteChoiceModel):
         Slower than the formula -- mainly for testing.
         """
         theta = jnp.asarray(theta)
-        core = self._core_theta(theta)
-        D_jkt = _diversion_vmap(
-            core, self.nest_matrix, self._availability_matrix_full
+        gamma_inside, rho, _ = self._gamma_components(theta)
+        D_jkt = _diversion_vmap_from_gamma(
+            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full
         )
         return D_jkt[:, :, 0]
+
+    # ── Public conversion helpers ────────────────────────────────
+
+    def gamma_from_theta(self, theta):
+        """Return the internal gamma-form theta corresponding to user theta.
+
+        gamma = delta / (1 - rho); gamma_xi = xi / (1 - rho).
+        Useful for diagnostics or for warm-starting internal optimizers.
+        """
+        return self._delta_theta_to_gamma(jnp.asarray(theta))
+
+    def theta_from_gamma(self, theta_gamma):
+        """Return the user-form theta corresponding to a gamma-form theta."""
+        return self._gamma_theta_to_delta(jnp.asarray(theta_gamma))

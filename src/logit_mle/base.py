@@ -27,7 +27,7 @@ class DiscreteChoiceModel:
     ):
         self.availability_matrix = jnp.array(availability_matrix)
         self.J, self.T = self.availability_matrix.shape
-        self._availability_matrix_full = jnp.ones((self.J, self.T))
+        self._availability_matrix_full = jnp.ones((self.J, self.T), dtype=bool)
         self.q_jt = jnp.array(q_jt) if q_jt is not None else None
         self._diversion_data = (
             jnp.array(diversion_data) if diversion_data is not None else None
@@ -202,20 +202,43 @@ class DiscreteChoiceModel:
     # ── Jacobian / elasticity internals ────────────────────────────
 
     def _compute_jacobian(self, theta):
-        """∂s_j/∂δ_k under full availability, market 0. Shape (J, J).
+        """∂s_j/∂δ_k at xi=0 under full availability, market 0. Shape (J, J).
 
-        Default uses JAX autodiff through the share function.
-        Subclasses may override with closed-form expressions.
+        Default uses JAX autodiff through the share function. We differentiate
+        with respect to the J-1 inside-good deltas, then recover the outside-good
+        column via the constant-shift invariance s(δ + c) = s(δ), which implies
+        Σ_k ∂s_j/∂δ_k = 0, so ∂s_j/∂δ_outside = -Σ_{k inside} ∂s_j/∂δ_k.
+
+        The Jacobian is evaluated with all market fixed effects ξ set to zero
+        (the ξ=0 baseline), matching the existing Logit/RC closed-form
+        overrides. Subclasses with market_fe must override
+        ``_theta_with_zero_xi`` so the hook knows how to zero ξ in their
+        packing layout. Subclasses may also override this method entirely
+        with closed-form expressions.
         """
+        theta = self._theta_with_zero_xi(theta)
         avail = self._availability_matrix_full
+        tail = theta[self.J - 1:]  # everything after the inside deltas
 
-        def shares_col0(delta_full):
-            # Rebuild theta with modified delta (first J-1 entries of theta)
-            new_theta = jnp.concatenate([delta_full[:-1], theta[self.J - 1:]])
+        def shares_col0(delta_inside):
+            new_theta = jnp.concatenate([delta_inside, tail])
             return self._compute_shares(new_theta, avail)[:, 0]
 
-        p = self._unpack_theta(theta)
-        return jax.jacobian(shares_col0)(p["delta"])
+        delta_inside = theta[:self.J - 1]
+        jac_inside = jax.jacobian(shares_col0)(delta_inside)              # (J, J-1)
+        outside_col = -jac_inside.sum(axis=1, keepdims=True)              # (J, 1)
+        return jnp.concatenate([jac_inside, outside_col], axis=1)         # (J, J)
+
+    def _theta_with_zero_xi(self, theta):
+        """Return theta with the market fixed effects ξ replaced by zero.
+
+        Default implementation: no market FE, so theta is returned unchanged.
+        Subclasses that store ξ in theta (i.e. ``market_fe=True``) must
+        override this hook so the base ``_compute_jacobian`` and any other
+        ``xi=0`` evaluation can be performed without knowing the packing
+        layout.
+        """
+        return theta
 
     def _compute_elasticity(self, theta, prices, price_coeff, price_col):
         """Price elasticity matrix. Shape (J, J).

@@ -10,7 +10,7 @@ Parameters:
                 last market normalized to 0)
 
 Diversion: D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ] integrated over sparse grid,
-evaluated at xi=0 (structural diversion).
+evaluated at the xi=0 baseline.
 """
 from __future__ import annotations
 
@@ -180,6 +180,15 @@ class RandomCoefficients(DiscreteChoiceModel):
             return delta_b + sigma_b + xi_b
         else:
             return delta_b + sigma_b
+
+    def _theta_with_zero_xi(self, theta):
+        """Replace ξ entries in theta with zero (ξ=0 baseline evaluation)."""
+        if not self.market_fe:
+            return theta
+        # theta layout: (delta[J-1], sigma[G], xi[T-1])
+        return jnp.concatenate(
+            [theta[:self.J - 1 + self.G], jnp.zeros(self.T - 1)]
+        )
 
     def _compute_jacobian(self, theta):
         """∂s_j/∂δ_k at xi=0. Shape (J, J)."""

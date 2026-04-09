@@ -2,7 +2,7 @@
 Parameter recovery tests for Logit and Nested Logit with market fixed effects.
 
 For each model:
-1. Fix true parameters (delta, xi, and sigma for NL)
+1. Fix true parameters (delta, xi, and rho for NL)
 2. Compute true shares under partial availability
 3. Simulate multinomial choice data from true shares
 4. Estimate via MLE
@@ -159,12 +159,12 @@ class TestNestedLogitMarketFE:
         T, I = 50, 10000
 
         delta_true = rng.randn(J_in) * 1.0
-        sigma_true = 0.6  # Train sigma
+        rho_true = 0.4  # Berry/Cardell rho
         nesting_ids = np.repeat(np.arange(G_nests), J_per_nest)
 
         avail = make_partial_availability(J, T, frac_available=0.8, seed=77)
 
-        theta_true = jnp.array(np.concatenate([delta_true, [sigma_true]]))
+        theta_true = jnp.array(np.concatenate([delta_true, [rho_true]]))
 
         model_true = NestedLogit(avail, nesting_ids=nesting_ids)
         s_jt = np.array(model_true.shares(theta_true))
@@ -174,19 +174,19 @@ class TestNestedLogitMarketFE:
         result = model.fit(seed=2025, verbose=False)
 
         delta_hat = result.x[:J_in]
-        sigma_hat = result.x[J_in]
+        rho_hat = result.x[J_in]
 
         print(f"\nNL no-FE recovery (J={J}, T={T}, I={I}):")
         print(f"  delta: max|err|={np.max(np.abs(delta_hat - delta_true)):.4f}")
-        print(f"  sigma: true={sigma_true:.4f}, hat={sigma_hat:.4f}")
+        print(f"  rho:   true={rho_true:.4f}, hat={rho_hat:.4f}")
 
         np.testing.assert_allclose(delta_hat, delta_true, atol=0.15,
             err_msg="NL: delta not recovered")
-        np.testing.assert_allclose(sigma_hat, sigma_true, atol=0.1,
-            err_msg="NL: sigma not recovered")
+        np.testing.assert_allclose(rho_hat, rho_true, atol=0.1,
+            err_msg="NL: rho not recovered")
 
     def test_recovery_with_fe(self):
-        """NL with market_fe=True recovers delta, sigma, and xi."""
+        """NL with market_fe=True recovers delta, rho, and xi."""
         rng = np.random.RandomState(42)
         J_per_nest, G_nests = 3, 3
         J_in = J_per_nest * G_nests
@@ -194,14 +194,14 @@ class TestNestedLogitMarketFE:
         T, I = 30, 10000
 
         delta_true = rng.randn(J_in) * 1.0
-        sigma_true = 0.5
+        rho_true = 0.5
         xi_true = rng.randn(T - 1) * 0.3
         nesting_ids = np.repeat(np.arange(G_nests), J_per_nest)
 
         avail = make_partial_availability(J, T, frac_available=0.8, seed=77)
 
-        # theta = (delta[J-1], sigma, xi[T-1])
-        theta_true = jnp.array(np.concatenate([delta_true, [sigma_true], xi_true]))
+        # theta = (delta[J-1], rho, xi[T-1])
+        theta_true = jnp.array(np.concatenate([delta_true, [rho_true], xi_true]))
 
         model_true = NestedLogit(avail, nesting_ids=nesting_ids, market_fe=True)
         s_jt = np.array(model_true.shares(theta_true))
@@ -211,21 +211,21 @@ class TestNestedLogitMarketFE:
         result = model.fit(seed=2025, verbose=False)
 
         delta_hat = result.x[:J_in]
-        sigma_hat = result.x[J_in]
+        rho_hat = result.x[J_in]
         xi_hat = result.x[J_in + 1:]
 
         print(f"\nNL market_fe recovery (J={J}, T={T}, I={I}):")
         print(f"  delta: max|err|={np.max(np.abs(delta_hat - delta_true)):.4f}, "
               f"RMSE={np.sqrt(np.mean((delta_hat - delta_true)**2)):.4f}")
-        print(f"  sigma: true={sigma_true:.4f}, hat={sigma_hat:.4f}, "
-              f"|err|={abs(sigma_hat - sigma_true):.4f}")
+        print(f"  rho:   true={rho_true:.4f}, hat={rho_hat:.4f}, "
+              f"|err|={abs(rho_hat - rho_true):.4f}")
         print(f"  xi:    max|err|={np.max(np.abs(xi_hat - xi_true)):.4f}, "
               f"RMSE={np.sqrt(np.mean((xi_hat - xi_true)**2)):.4f}")
 
         np.testing.assert_allclose(delta_hat, delta_true, atol=0.2,
             err_msg="NL market_fe: delta not recovered")
-        np.testing.assert_allclose(sigma_hat, sigma_true, atol=0.15,
-            err_msg="NL market_fe: sigma not recovered")
+        np.testing.assert_allclose(rho_hat, rho_true, atol=0.15,
+            err_msg="NL market_fe: rho not recovered")
         np.testing.assert_allclose(xi_hat, xi_true, atol=0.2,
             err_msg="NL market_fe: xi not recovered")
 
@@ -240,11 +240,11 @@ class TestNestedLogitMarketFE:
         nesting_ids = np.repeat(np.arange(G_nests), J_per_nest)
 
         delta = rng.randn(J_in) * 0.5
-        sigma = 0.5
+        rho = 0.5
         xi = np.array([0.5, -0.5, 1.0])  # T-1 = 3
 
-        theta_fe = jnp.array(np.concatenate([delta, [sigma], xi]))
-        theta_plain = jnp.array(np.concatenate([delta, [sigma]]))
+        theta_fe = jnp.array(np.concatenate([delta, [rho], xi]))
+        theta_plain = jnp.array(np.concatenate([delta, [rho]]))
 
         model_fe = NestedLogit(avail, nesting_ids=nesting_ids, market_fe=True)
         model_plain = NestedLogit(avail, nesting_ids=nesting_ids)
@@ -270,11 +270,11 @@ class TestNestedLogitMarketFE:
         nesting_ids = np.repeat(np.arange(G_nests), J_per_nest)
 
         delta = rng.randn(J_in) * 0.5
-        sigma = 0.5
+        rho = 0.5
         xi = rng.randn(T - 1) * 0.5
 
-        theta_fe = jnp.array(np.concatenate([delta, [sigma], xi]))
-        theta_plain = jnp.array(np.concatenate([delta, [sigma]]))
+        theta_fe = jnp.array(np.concatenate([delta, [rho], xi]))
+        theta_plain = jnp.array(np.concatenate([delta, [rho]]))
 
         model_fe = NestedLogit(avail, nesting_ids=nesting_ids, market_fe=True)
         model_plain = NestedLogit(avail, nesting_ids=nesting_ids)

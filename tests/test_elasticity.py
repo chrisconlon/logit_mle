@@ -116,8 +116,8 @@ class TestNestedLogitElasticity:
         nesting_ids = np.repeat(np.arange(G), J_per_nest)
         avail = np.ones((J, 1), dtype=bool)
         deltas = rng.randn(J_in) * 0.5
-        sigma_train = 0.5
-        theta = jnp.array(np.concatenate([deltas, [sigma_train]]))
+        rho = 0.5
+        theta = jnp.array(np.concatenate([deltas, [rho]]))
         prices = np.abs(rng.randn(J)) + 1.0
         alpha = -0.5
 

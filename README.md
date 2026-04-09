@@ -58,11 +58,21 @@ result = model.fit(seed=2025)
 D = model.diversion_matrix(result.x)
 ```
 
-**Parameters:** `theta = (delta[J-1], sigma)` where `sigma` is Train's nesting parameter (Berry/Cardell `rho = 1 - sigma`). With `market_fe=True`: `theta = (delta[J-1], sigma, xi[T-1])`.
+**Parameters:** `theta = (delta[J-1], rho)` where `rho` is the Berry/Cardell nesting parameter, $\rho \in [0, 1)$. $\rho = 0$ collapses to plain logit; $\rho \to 1$ corresponds to perfect within-nest correlation. With `market_fe=True`: `theta = (delta[J-1], rho, xi[T-1])`.
+
+> **Note on parameterization (Berry vs Train).** Two conventions appear in the literature for the single nesting parameter. Berry/Cardell uses $\rho \in [0,1)$ with $\rho=0 \Rightarrow$ logit; Train/McFadden uses $\lambda \in (0,1]$ with $\lambda=1 \Rightarrow$ logit. The conversion is exactly $\rho = 1 - \lambda$. We use Berry's convention throughout. The share formulas are
+> - $s_{j|g} = \exp(\delta_j / (1-\rho)) / D_g$ where $D_g = \sum_{k\in J_g}\exp(\delta_k/(1-\rho))$
+> - $s_g = D_g^{1-\rho} / \sum_{g'} D_{g'}^{1-\rho}$
+>
+> **Internal reparameterization for optimization.** The `(delta, rho)` likelihood landscape has a problematic cross-partial: $\delta$ appears inside $\exp(\delta/(1-\rho))$, so changing $\rho$ rescales every $\delta_j$ at the same time. The optimizer fights two entangled effects, and small numerical issues near $\rho \in \{0, 1\}$ produce NaNs in the gradient. We fix this by optimizing over $\gamma_j = \delta_j / (1-\rho)$ instead. With this substitution:
+> - $s_{j|g} = \exp(\gamma_j) / \sum_k \exp(\gamma_k)$ — depends only on $\gamma$, not on $\rho$
+> - $s_g = D_g^{1-\rho} / \sum_{g'} D_{g'}^{1-\rho}$ where now $D_g = \sum_k \exp(\gamma_k)$ — $\rho$ enters only as an exponent
+>
+> Conditional shares are now $\rho$-free, and there is no division by $(1-\rho)$ anywhere, so the $\rho \to 1$ singularity is gone. Empirically the optimizer becomes much more robust to starting values: in our tests, all 10 random seeds converge to the same basin in $(\gamma, \rho)$ form, vs about 3 of 10 in $(\delta, \rho)$ form. The substitution is **transparent to the user**: `fit()` accepts and returns `theta` in $(\delta, \rho, \xi)$ form, and `shares()` / `diversion_matrix()` take $(\delta, \rho, \xi)$ as input. The $\gamma$ reparameterization is purely an internal device inside `fit()`. Helpers `gamma_from_theta(theta)` and `theta_from_gamma(theta_gamma)` are available if you need to inspect or warm-start in $\gamma$-space.
 
 **Constructor:** `nesting_ids` is a `(J-1,)` integer array assigning each inside good to a nest. The outside good is automatically placed in its own singleton nest.
 
-**Diversion:** Closed-form formula (tau_in/tau_out notation). A vmap product-removal method is also available via `model.compute_diversion_matrix_vmap(theta)` for testing.
+**Diversion:** Closed-form formula (tau_in/tau_out notation, see `paper/sections/appendix_theory.tex`). A vmap product-removal method is also available via `model.compute_diversion_matrix_vmap(theta)` for testing.
 
 **Additional methods:**
 - `model.compute_model_shares(theta)` returns `(S_gjt, S_gt, S_jt)` -- full share decomposition by nest
@@ -112,7 +122,7 @@ model = Logit(availability_matrix, q_jt, market_fe=True)
 
 # NL with market FE
 model = NestedLogit(availability_matrix, q_jt, nesting_ids=ids, market_fe=True)
-# theta = (delta[J-1], sigma, xi[T-1])
+# theta = (delta[J-1], rho, xi[T-1])
 
 # RCC with market FE
 model = RandomCoefficients(availability_matrix, q_jt,
@@ -120,7 +130,7 @@ model = RandomCoefficients(availability_matrix, q_jt,
 # theta = (delta[J-1], sigma[G], xi[T-1])
 ```
 
-The last market is the normalization (`xi[T-1] = 0`). Diversion, Jacobian, and elasticity are always evaluated at `xi = 0` (structural, market-invariant).
+The last market is the normalization (`xi[T-1] = 0`). Diversion, Jacobian, and elasticity are always evaluated at the `xi = 0` baseline (market-invariant).
 
 ## Elasticities
 
