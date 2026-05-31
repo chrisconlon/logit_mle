@@ -205,16 +205,89 @@ def make_qp_solver(Gram, b):
     return solve
 
 
-def solve_qp(Gram, b, mu, *, backend="cvxpy", **opts):
-    """One-off solve of the nonnegative elastic-net QP (see :func:`make_qp_solver`).
+@jax.jit
+def _project_simplex(v):
+    """Euclidean projection onto {x >= 0, sum x = 1} (Duchi et al. 2008)."""
+    R = v.shape[0]
+    u = jnp.sort(v)[::-1]
+    css = jnp.cumsum(u) - 1.0
+    idx = jnp.arange(1, R + 1)
+    rho = jnp.sum(u - css / idx > 0)
+    tau = css[rho - 1] / rho
+    return jnp.maximum(v - tau, 0.0)
 
-    For a ``mu`` sweep, build the solver once with :func:`make_qp_solver` instead.
+
+def _power_lambda_max(Gram, n_iter=50):
+    """Largest eigenvalue of a PSD matrix via power iteration (O(R^2) per step)."""
+    R = Gram.shape[0]
+    v0 = jnp.ones(R) / jnp.sqrt(R)
+    v = jax.lax.fori_loop(
+        0, n_iter, lambda i, v: (lambda w: w / jnp.linalg.norm(w))(Gram @ v), v0
+    )
+    return v @ (Gram @ v)
+
+
+def make_pgd_solver(Gram, b, *, lmax_iter=50):
+    """Pure-JAX accelerated projected gradient (FISTA) for the same QP as
+    :func:`make_qp_solver`; returns ``solve(mu, tol=..., max_iter=...) -> theta``.
+
+    No factorization (the gradient ``2(Gram theta + mu theta - b)`` is an O(R^2)
+    matvec) and no cvxpy dependency.  Intended for large ``R`` on a CUDA GPU,
+    where the matvecs and a ``vmap`` over ``mu`` parallelize; on CPU it is
+    neutral-to-slower than warm-started OSQP (see ``docs/hho_design.md`` §11).
+    Convergence is adaptive: stop when ``||theta_{k+1} - theta_k|| < tol`` or at
+    ``max_iter``.  ``lambda_max(Gram)`` (for the step size) is computed once and
+    reused across ``mu`` since ``lambda_max(Gram + mu I) = lambda_max(Gram) + mu``.
     """
-    if backend != "cvxpy":
+    Gram = jnp.asarray(Gram, dtype=float)
+    Gram = 0.5 * (Gram + Gram.T)
+    b = jnp.asarray(b, dtype=float)
+    R = Gram.shape[0]
+    lam = _power_lambda_max(Gram, lmax_iter)
+
+    @jax.jit
+    def solve(mu, tol=1e-9, max_iter=100_000):
+        mu = jnp.asarray(mu, dtype=float)
+        step = 1.0 / (2.0 * (lam + mu))
+
+        def grad(x):                       # 2 (P x - b),  P = Gram + mu I
+            return 2.0 * (Gram @ x + mu * x - b)
+
+        th0 = jnp.full(R, 1.0 / R)
+        init = (th0, th0, 1.0, jnp.array(0), jnp.array(jnp.inf))
+
+        def cond(c):
+            _, _, _, k, gap = c
+            return (k < max_iter) & (gap > tol)
+
+        def body(c):
+            th, y, t, k, _ = c
+            th1 = _project_simplex(y - step * grad(y))
+            t1 = 0.5 * (1.0 + jnp.sqrt(1.0 + 4.0 * t * t))
+            y1 = th1 + ((t - 1.0) / t1) * (th1 - th)
+            return (th1, y1, t1, k + 1, jnp.linalg.norm(th1 - th))
+
+        th, _, _, _, _ = jax.lax.while_loop(cond, body, init)
+        return th
+
+    return solve
+
+
+_SOLVER_MAKERS = {"cvxpy": make_qp_solver, "pgd": make_pgd_solver}
+
+
+def solve_qp(Gram, b, mu, *, backend="cvxpy", **opts):
+    """One-off solve of the nonnegative elastic-net QP.
+
+    ``backend="cvxpy"`` (default, needs the ``[hho]`` extra) or ``"pgd"`` (pure
+    JAX).  For a ``mu`` sweep, build the solver once with :func:`make_qp_solver`
+    or :func:`make_pgd_solver` instead.
+    """
+    if backend not in _SOLVER_MAKERS:
         raise NotImplementedError(
-            f"solver backend {backend!r} not implemented (cvxpy only for now)"
+            f"solver backend {backend!r} not in {sorted(_SOLVER_MAKERS)}"
         )
-    return make_qp_solver(Gram, b)(mu, **opts)
+    return np.asarray(_SOLVER_MAKERS[backend](Gram, b)(mu, **opts))
 
 
 # ── Step 3: cross-validation over the ridge parameter mu ─────────
@@ -296,6 +369,7 @@ def cross_validate_mu(
     train_pct=0.9,
     random_state=2025,
     select="one_se",
+    backend="cvxpy",
     solver_opts=None,
 ):
     """Cross-validate the ridge ``mu`` by out-of-sample share fit, folding over markets.
@@ -319,6 +393,11 @@ def cross_validate_mu(
         mu_grid = np.r_[0.0, np.logspace(-6.0, 1.0, 24)]
     mu_grid = np.unique(np.asarray(mu_grid, dtype=float))      # sorted ascending
     solver_opts = solver_opts or {}
+    if backend not in _SOLVER_MAKERS:
+        raise NotImplementedError(
+            f"solver backend {backend!r} not in {sorted(_SOLVER_MAKERS)}"
+        )
+    maker = _SOLVER_MAKERS[backend]
 
     availability_matrix = np.asarray(availability_matrix)
     J, T = availability_matrix.shape
@@ -340,9 +419,9 @@ def cross_validate_mu(
         te = np.isin(market_of_row, test)
         Ztr, ytr = Z[tr], s_obs[tr]
         Zte, yte = Z[te], s_obs[te]
-        solve = make_qp_solver(Ztr.T @ Ztr, Ztr.T @ ytr)
-        for m, mu in enumerate(mu_grid):                       # ascending -> warm-started
-            theta = solve(mu, **solver_opts)
+        solve = maker(Ztr.T @ Ztr, Ztr.T @ ytr)
+        for m, mu in enumerate(mu_grid):                       # ascending -> warm-started (cvxpy)
+            theta = np.asarray(solve(mu, **solver_opts))
             resid = yte - Zte @ theta
             per_fold[f, m] = float(np.mean(resid ** 2))
 
@@ -360,8 +439,8 @@ def cross_validate_mu(
         raise ValueError(f"select must be 'one_se' or 'argmin', got {select!r}")
     mu_selected = mu_1se if select == "one_se" else mu_argmin
 
-    solve_full = make_qp_solver(Z.T @ Z, Z.T @ s_obs)
-    theta_hat = solve_full(mu_selected, **solver_opts)
+    solve_full = maker(Z.T @ Z, Z.T @ s_obs)
+    theta_hat = np.asarray(solve_full(mu_selected, **solver_opts))
 
     return CVResult(
         mu_grid=mu_grid,
@@ -441,6 +520,8 @@ class FixedGridRC:
         self.G = self.x2.shape[1]
         self.market_fe = bool(market_fe)
         self.drop_cols = tuple(drop_cols)
+        if solver not in _SOLVER_MAKERS:
+            raise ValueError(f"solver must be one of {sorted(_SOLVER_MAKERS)}, got {solver!r}")
         self.solver = solver
 
         delta_hat = np.asarray(delta_hat, dtype=float)
@@ -506,7 +587,8 @@ class FixedGridRC:
         cv = cross_validate_mu(
             self.delta_inside, self.xi, self.x2, self.beta_grid, self.avail, self.q_jt,
             drop_cols=self.drop_cols, mu_grid=mu_grid, k=k, train_pct=train_pct,
-            random_state=random_state, select=select, solver_opts=solver_opts,
+            random_state=random_state, select=select, backend=self.solver,
+            solver_opts=solver_opts,
         )
         return FixedGridResult(
             delta_inside=self.delta_inside, xi=self.xi, x2=self.x2, avail=self.avail,

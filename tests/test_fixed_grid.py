@@ -487,3 +487,63 @@ def test_cross_solver_agreement():
         if mu > 0:
             # regularization identifies the weights -> solvers agree on theta too
             assert np.max(np.abs(th_osqp - th_clar)) < 1e-2
+
+
+# ── JAX-PGD backend (pure JAX; cvxpy stays default) ─────────────
+
+def test_pgd_matches_cvxpy_backend():
+    """The pure-JAX FISTA backend matches cvxpy: diversion at all mu, theta at mu>0."""
+    pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=24, G=3, R=60, nonzero_xi=True, seed=3)
+    q = _planted_q_jt(p)
+    Z, _ = build_design_matrix(p["delta_inside"], p["xi"], p["x2"], p["beta_grid"],
+                               p["avail"])
+    Z = np.asarray(Z)
+    s_obs = (q / q.sum(axis=0, keepdims=True)).reshape(-1)
+    Gram, b = Z.T @ Z, Z.T @ s_obs
+    sigma_vec, nu_full = grid_to_rc_inputs(p["beta_grid"], (), p["G"])
+    avail_full = np.ones((p["J"], 1), dtype=bool)
+    off = ~np.eye(p["J"], dtype=bool)
+
+    def diversion(theta):
+        return np.asarray(
+            _diversion_jk(p["delta_inside"], sigma_vec, p["x2"], nu_full, theta, avail_full)
+        )
+
+    for mu in (0.0, 1e-3):
+        th_pgd = solve_qp(Gram, b, mu, backend="pgd")
+        th_cvx = solve_qp(Gram, b, mu, backend="cvxpy")
+        Dp, Dc = diversion(th_pgd), diversion(th_cvx)
+        assert np.corrcoef(Dp[off], Dc[off])[0, 1] > 0.999
+        assert np.max(np.abs(Dp[off] - Dc[off])) < 0.02
+        if mu > 0:
+            assert np.max(np.abs(th_pgd - th_cvx)) < 1e-2
+
+
+def test_fit_pgd_backend_matches_cvxpy():
+    """End-to-end fit(solver='pgd') agrees with the cvxpy fit on diversion."""
+    pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=24, G=3, R=40, nonzero_xi=True, seed=7)
+    q = _planted_q_jt(p)
+
+    def fit(solver, **kw):
+        fg = FixedGridRC(p["delta_inside"], p["sigma_hat"], p["xi"],
+                         x2=p["x2"], availability_matrix=p["avail"], q_jt=q,
+                         market_fe=True, beta_grid=p["beta_grid"], solver=solver)
+        return fg.fit(k=4, mu_grid=np.r_[0.0, np.logspace(-4, 0, 5)], random_state=1, **kw)
+
+    r_cvx = fit("cvxpy")
+    r_pgd = fit("pgd", solver_opts={"tol": 1e-8, "max_iter": 20000})
+    off = ~np.eye(p["J"], dtype=bool)
+    Dc, Dp = r_cvx.diversion_matrix(), r_pgd.diversion_matrix()
+    assert np.corrcoef(Dp[off], Dc[off])[0, 1] > 0.99
+    assert np.all(r_pgd.theta_hat >= -1e-9)
+    np.testing.assert_allclose(r_pgd.theta_hat.sum(), 1.0, atol=1e-6)
+
+
+def test_fixedgridrc_rejects_unknown_solver():
+    p = make_problem(seed=0)
+    with pytest.raises(ValueError):
+        FixedGridRC(p["delta_inside"], p["sigma_hat"], None,
+                    x2=p["x2"], availability_matrix=p["avail"], q_jt=_planted_q_jt(p),
+                    beta_grid=p["beta_grid"], solver="nope")

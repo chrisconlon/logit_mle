@@ -29,11 +29,12 @@ indicator (`drop_cols` holds a characteristic homogeneous, e.g. price). No new s
 
 Reuse gotchas:
 
-- `cvxpy` is an optional `[hho]` extra (lazy-imported); solver is OSQP. The hho tests
-  skip if cvxpy is absent.
-- Cost is factorization-bound (~`R^2.7`/solve); fine for `R <= ~500`. Levers at large
-  `R`: fewer `mu` points, coarser grid, or a JAX projected-gradient backend (the
-  `_solve_qp` `backend` switch exists for it).
+- Two solver backends: `solver="cvxpy"` (default; OSQP via the optional `[hho]` extra,
+  lazy-imported) and `solver="pgd"` (pure-JAX FISTA, `make_pgd_solver`; no cvxpy needed).
+  cvxpy/OSQP cost is factorization-bound (~`R^2.7`/solve); fine for `R <= ~500`.
+- `solver="pgd"` matches cvxpy (~1e-5) but is CPU-neutral-to-slower; it is the large-`R`
+  path **only on a CUDA GPU**. Apple Metal/jax-metal is a dead end (broken on current jax,
+  hangs on legacy); the Neural Engine is not a JAX target. See docs §11.
 - Identification needs many markets with real cross-market variation (assortment or
   price). Diversion is robust, but the raw grid weights are non-unique on a dense grid
   without a ridge (`mu>0`) — report substitution, not the weights. See docs §10–11.

@@ -131,7 +131,7 @@ beta, theta = res.f_beta()                      # the estimated mixing distribut
 
 Requires the `hho` extra for `cvxpy` (`uv pip install -e ".[hho]"`). Construct from raw arrays (`FixedGridRC(delta_hat, sigma_hat, xi_hat, x2=..., availability_matrix=..., q_jt=...)`) or via `from_fitted`. Hold characteristics out of the grid (homogeneous) with `drop_cols=(price_col,)`. The result delegates `shares()` / `diversion_matrix()` / `elasticity_matrix()` to the existing `RandomCoefficients` machinery (grid as nodes, `theta` as weights), so it is directly comparable to the normal-RC run. See [`docs/hho_design.md`](docs/hho_design.md).
 
-**Notes.** Identification needs many markets with real cross-market variation (assortment or price). Diversion is robust, but the raw grid weights are non-unique on a dense grid without regularization (`mu > 0`). Solver is cvxpy/OSQP; cost is factorization-bound (fine for `R <= ~500`).
+**Notes.** Identification needs many markets with real cross-market variation (assortment or price). Diversion is robust, but the raw grid weights are non-unique on a dense grid without regularization (`mu > 0`). Default solver is cvxpy/OSQP (factorization-bound, fine for `R <= ~500`); a pure-JAX `solver="pgd"` backend (no cvxpy) is available for large `R` on a CUDA GPU.
 
 ## Market fixed effects
 
