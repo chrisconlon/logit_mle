@@ -333,6 +333,14 @@ beta_grid, theta_hat = res.f_beta()        # the estimated mixing distribution
    assortment (availability) and/or price/\(\xi\).  The capstone uses assortment variation (the
    cleanest case); the hotel application has ~fixed assortment and relies on price/time
    variation, which is weaker — consistent with the paper's "lack of choice-set variation."
+6. **What is identified: diversion, not the raw weights.** On a dense grid `Gram` is
+   near-singular (correlated columns), so the FKRB (`mu=0`) weights `theta` are *non-unique* —
+   two QP solvers return different `theta` (L1 distance ~0.5) even when `JT >> R`.  This is
+   FKRB's "random selection among correlated grid points."  The ridge (`mu>0`) makes the QP
+   strictly convex and identifies `theta` (solvers then agree).  Crucially, *diversion* is
+   robust regardless of `mu` (solvers agree to corr ~1.0 even at `mu=0`): different `theta`
+   fitting the same shares imply the same substitution.  Report substitution objects, not the
+   weights; and prefer `mu>0` if the distribution itself is of interest.
 
 ## 11. Performance and solver scaling
 
@@ -345,11 +353,15 @@ beta_grid, theta_hat = res.f_beta()        # the estimated mixing distribution
 - **Loosening tolerance does *not* help** — `eps` from `1e-9` to `1e-4` leaves sweep time
   unchanged (it's the factorization, not iteration count, that dominates).  Warm-start and the
   DPP parameterization help iterations, so their benefit also shrinks as `R` grows.
-- **OSQP is the default and is faster than Clarabel** here (≈2× at `R=250`, ≈1.3× at `R=1000`),
-  and the two agree to ~1e-5 on `theta` (a useful correctness cross-check).  Use **Clarabel**
-  (`solver=cp.CLARABEL`) as a fallback when `Gram` is near-singular (very dense grid,
-  \(R \to JT\)) where interior-point is more robust than ADMM, or for a high-accuracy final
-  refit.
+- **OSQP is the default and is faster than Clarabel** here (≈2× at `R=250`, ≈1.3× at `R=1000`).
+  On the *weights* they agree only once regularized: at `mu=0` on a dense grid `Gram` is
+  near-singular (cond ~1e18–1e19 even when `JT >> R`), the FKRB minimizer is non-unique, and
+  the two solvers return different `theta` (L1 distance ~0.5).  With a ridge (`mu>0`) `P` is
+  strictly PD (cond ~1e5) and they agree on `theta` to ~1e-3.  **Diversion agrees across
+  solvers regardless of `mu`** (corr ~1.0) — different `theta` that fit the same shares imply
+  the same substitution.  Use **Clarabel** (`solver=cp.CLARABEL`) as a fallback for very dense
+  / near-singular `Gram` (interior-point is more robust than ADMM there) or a high-accuracy
+  final refit.
 - **Levers if `R` grows large** (in order): fewer `mu` points / adaptive search; a coarser
   `beta` grid (the curse of dimensionality caps `R` in the low hundreds anyway); then the
   pure-JAX projected-gradient backend (gradient `(Gram+mu*I)theta - b` is an \(O(R^2)\) matvec,

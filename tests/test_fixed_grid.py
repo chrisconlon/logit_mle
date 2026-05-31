@@ -20,8 +20,9 @@ from logit_mle import (
     FixedGridRC, FixedGridResult,
 )
 from logit_mle.fixed_grid import (
-    grid_to_rc_inputs, solve_qp, make_market_folds, cross_validate_mu,
+    grid_to_rc_inputs, solve_qp, make_qp_solver, make_market_folds, cross_validate_mu,
 )
+from logit_mle.random_coefficients import _diversion_jk
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -449,3 +450,40 @@ def test_normal_recovery_capstone():
     assert corr(D_np, D_normal) > 0.99
     assert np.mean(np.abs(D_np[off] - D_normal[off])) < 0.005
     assert corr(D_np, D_true) > 0.99
+
+
+# ── Cross-solver: identification of weights vs. diversion ────────
+
+def test_cross_solver_agreement():
+    """OSQP vs Clarabel.  On a dense grid the FKRB weights theta are non-unique
+    (Gram near-singular), so the solvers need *not* agree on theta at mu=0 -- but the
+    ridge identifies theta (they agree at mu>0), and *diversion* agrees regardless.
+    This encodes what is identified (substitution) vs what is not (the raw weights).
+    """
+    cp = pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=24, G=3, R=60, nonzero_xi=True, seed=3)
+    q = _planted_q_jt(p)
+    Z, _ = build_design_matrix(p["delta_inside"], p["xi"], p["x2"], p["beta_grid"],
+                               p["avail"])
+    Z = np.asarray(Z)
+    s_obs = (q / q.sum(axis=0, keepdims=True)).reshape(-1)
+    Gram, b = Z.T @ Z, Z.T @ s_obs
+    sigma_vec, nu_full = grid_to_rc_inputs(p["beta_grid"], (), p["G"])
+    avail_full = np.ones((p["J"], 1), dtype=bool)
+    off = ~np.eye(p["J"], dtype=bool)
+
+    def diversion(theta):
+        return np.asarray(
+            _diversion_jk(p["delta_inside"], sigma_vec, p["x2"], nu_full, theta, avail_full)
+        )
+
+    for mu in (0.0, 1e-3):
+        th_osqp = make_qp_solver(Gram, b)(mu, solver=cp.OSQP)
+        th_clar = make_qp_solver(Gram, b)(mu, solver=cp.CLARABEL)
+        D_osqp, D_clar = diversion(th_osqp), diversion(th_clar)
+        # diversion (the identified object) agrees across solvers regardless of mu
+        assert np.corrcoef(D_osqp[off], D_clar[off])[0, 1] > 0.999
+        assert np.max(np.abs(D_osqp[off] - D_clar[off])) < 0.02
+        if mu > 0:
+            # regularization identifies the weights -> solvers agree on theta too
+            assert np.max(np.abs(th_osqp - th_clar)) < 1e-2
