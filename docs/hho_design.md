@@ -104,7 +104,7 @@ class FixedGridRC:
         drop_cols           : tuple[int] columns of x2 held homogeneous (no grid dim;
                               deviation fixed at 0) -- e.g. the price column
         grid_size,span,grid_seed : default-grid controls (only when beta_grid is None)
-        solver              : "cvxpy" (default); behind the _solve_qp interface (Section 5.4)
+        solver              : "cvxpy" (default, OSQP) or "pgd" (pure-JAX); see §5.4 / §11
         """
 
     @classmethod
@@ -194,8 +194,10 @@ prob  = cp.Problem(obj, [cp.sum(theta) == 1])     # nonneg via Variable(nonneg=T
 
 Notes: OSQP (or Clarabel) is the backend solver; assert `prob.status == "optimal"`;
 warm-start along the `mu` path (continuation) so each solve starts from the previous
-\(\hat\theta\). A future `_solve_qp_pgd` (pure-JAX projected gradient onto the simplex) can
-implement the same signature without touching the rest; not needed at current scale.
+\(\hat\theta\). Implemented as `make_qp_solver` returning a `solve(mu)` closure.  A second
+backend, `make_pgd_solver` (pure-JAX FISTA, `backend="pgd"`), implements the same
+`solve(mu)` interface — selected via `solve_qp(..., backend=)` / `FixedGridRC(..., solver=)`;
+cvxpy stays the default.  See §11.
 
 ### 5.5 Cross-validate `mu` (`cross_validate_mu`)
 
@@ -278,8 +280,9 @@ sparse = ["chaospy"]
 hho    = ["cvxpy"]
 ```
 
-Core install stays `numpy / scipy / jax / jaxlib`. `FixedGridRC` raises a clear ImportError
-with the install hint if cvxpy is missing (same pattern as `sparse_grid`).
+Core install stays `numpy / scipy / jax / jaxlib`. The default `cvxpy` backend raises a clear
+ImportError with the install hint if cvxpy is missing (same pattern as `sparse_grid`).  The
+`solver="pgd"` backend is pure JAX and needs **no** extra — usable on the core install alone.
 
 ## 9. Public surface
 
