@@ -232,21 +232,38 @@ print("MLE  sigma :", np.asarray(sigma_hat))
 #
 # `nesting_ids` is a length-`(J-1)` integer vector assigning each inside good to a nest; the
 # outside good is its own singleton nest. `theta = (delta[J-1], rho)`.
+#
+# **Identification note** (a preview of Section 7): like the random-coefficient variance,
+# $\rho$ is identified by **cross-market variation in choice sets**, so we simulate many
+# markets with varying availability. A *single* market would leave $\rho$ unidentified — the
+# $J-1$ mean utilities $\delta$ can fit any one share vector regardless of $\rho$.
 
 # %%
 rng = np.random.RandomState(0)
-J_in_nl, n_nests = 6, 2
+J_in_nl, n_nests, T_nl = 6, 2, 50
 nesting_ids = np.repeat(np.arange(n_nests), J_in_nl // n_nests)   # [0,0,0,1,1,1]
-avail_nl = np.ones((J_in_nl + 1, 1), dtype=bool)
-# synthesize counts from a true nested logit (rho = 0.6)
-nl_true = NestedLogit(avail_nl, np.ones((J_in_nl + 1, 1)), nesting_ids=nesting_ids)
-theta_nl_true = np.concatenate([rng.uniform(-1.5, 0.5, J_in_nl), [0.6]])
-q_nl = np.asarray(nl_true.shares(theta_nl_true)) * 1000.0
+J_nl = J_in_nl + 1
 
-nl = NestedLogit(avail_nl, q_nl, nesting_ids=nesting_ids)
-res_nl = nl.fit(seed=rng_seed, verbose=False)
-rho_hat = float(res_nl.x[-1])
-print(f"true rho = 0.60   estimated rho = {rho_hat:.3f}")
+# rho is identified by choice-set variation, so vary availability across T markets.
+avail_nl = rng.rand(J_nl, T_nl) < 0.8
+avail_nl[J_nl - 1, :] = True                          # outside always available
+for t in range(T_nl):                                 # >= 2 inside goods per market
+    if avail_nl[:J_in_nl, t].sum() < 2:
+        avail_nl[rng.choice(J_in_nl, 2, replace=False), t] = True
+
+# synthesize noisy counts from a true nested logit (rho = 0.6)
+with quiet():
+    nl_true = NestedLogit(avail_nl, np.ones((J_nl, T_nl)), nesting_ids=nesting_ids)
+theta_nl_true = np.concatenate([rng.uniform(-1.5, 0.5, J_in_nl), [0.6]])
+s_nl = np.asarray(nl_true.shares(theta_nl_true))
+q_nl = np.empty_like(s_nl)
+for t in range(T_nl):
+    q_nl[:, t] = rng.multinomial(2000, s_nl[:, t] / s_nl[:, t].sum())
+
+with quiet():
+    nl = NestedLogit(avail_nl, q_nl, nesting_ids=nesting_ids)
+    res_nl = nl.fit(seed=rng_seed, verbose=False)
+print(f"true rho = 0.60   estimated rho = {float(res_nl.x[-1]):.3f}")
 
 D_nl = np.asarray(nl.diversion_matrix(res_nl.x))
 same_nest = nesting_ids[:, None] == nesting_ids[None, :]
