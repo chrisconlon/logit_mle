@@ -112,3 +112,59 @@ def halton_draws(G, n, *, seed=0, scramble=True):
     nu_i = norm.ppf(uniform)
     w_i = np.ones(n) / n
     return nu_i, w_i
+
+
+def beta_grid_box(
+    sigma_hat: np.ndarray,
+    n: int,
+    *,
+    span: float = 3.0,
+    seed: int = 0,
+    scramble: bool = True,
+) -> np.ndarray:
+    """Low-discrepancy grid of random-coefficient *deviation* vectors over a box.
+
+    For the fixed-grid (FKRB/HHO) estimator.  Lays ``n`` grid points covering
+    ``[-span * sigma_g, +span * sigma_g]`` per dimension, centered at 0, via a
+    scrambled Halton sequence.
+
+    Unlike :func:`halton_draws`, this returns *space-filling* points over the box
+    (no inverse-normal transform) and **no weights** — for a fixed grid the
+    weights are estimated by the second-stage QP, not fixed at ``1/n``.  This is
+    the grid placement used by Heiss, Hetzenecker & Osterhaus (2022): a Halton
+    grid chosen to keep correlation among grid points low.
+
+    Parameters
+    ----------
+    sigma_hat : ndarray, shape (G,)
+        Step-1 random-coefficient std devs; sets the box half-width per
+        dimension.  Pass ``sigma_hat[keep]`` to grid only a subset of
+        characteristics (the rest being held homogeneous via ``drop_cols``).
+    n : int
+        Number of grid points ``R``.
+    span : float
+        Box half-width in units of ``sigma_hat`` (default 3.0).
+    seed : int
+        Seed for the scrambled Halton sequence (default 0).
+    scramble : bool
+        If True (default), use Owen scrambling for better uniformity.
+
+    Returns
+    -------
+    beta_grid : ndarray, shape (n, G)
+        Grid of deviation vectors, space-filling over the box, centered at 0.
+
+    Examples
+    --------
+    >>> sigma_hat = np.array([0.5, 0.8, 0.3, 1.0])
+    >>> beta_grid = beta_grid_box(sigma_hat, n=250)
+    >>> beta_grid.shape
+    (250, 4)
+    """
+    from scipy.stats.qmc import Halton
+
+    sigma_hat = np.asarray(sigma_hat, dtype=float)
+    G = sigma_hat.shape[0]
+    u = Halton(d=G, scramble=scramble, seed=seed).random(n)   # (n, G) in [0, 1]
+    half = span * sigma_hat                                   # (G,)
+    return (-half)[None, :] + (2.0 * half)[None, :] * u        # (n, G)

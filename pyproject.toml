@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 sparse = ["chaospy"]
+hho = ["cvxpy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
