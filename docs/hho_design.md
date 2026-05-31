@@ -363,10 +363,22 @@ beta_grid, theta_hat = res.f_beta()        # the estimated mixing distribution
   / near-singular `Gram` (interior-point is more robust than ADMM there) or a high-accuracy
   final refit.
 - **Levers if `R` grows large** (in order): fewer `mu` points / adaptive search; a coarser
-  `beta` grid (the curse of dimensionality caps `R` in the low hundreds anyway); then the
+  `beta` grid (the curse of dimensionality caps `R` in the low hundreds anyway); then a
   pure-JAX projected-gradient backend (gradient `(Gram+mu*I)theta - b` is an \(O(R^2)\) matvec,
-  no factorization, GPU-batchable across `mu`), which slots behind the existing `_solve_qp`
-  `backend` switch.
+  no factorization, batchable across `mu`), which would slot behind the `_solve_qp` `backend`
+  switch (currently cvxpy-only).
+- **JAX PGD backend — explored, not adopted (CPU is the reason).** A FISTA solver (accelerated
+  projected gradient + simplex projection) was prototyped and benchmarked.  It is **correct** —
+  matches OSQP to ~1e-5 on `theta` and objective, including the ill-conditioned `mu=1e-3` case.
+  But on **CPU it is not faster**: single solve ties OSQP, and the batched `vmap` over `mu` is
+  *slower* (≈16 s vs OSQP's warm-started 5.6 s sweep at `R=1000`), because CPU `vmap` serializes
+  the batch (no parallelism to exploit) while OSQP warm-starts along the `mu` path.  The
+  batching payoff needs a **CUDA GPU**.  Apple Metal is not a viable path: `jax-metal` installs
+  and registers the M-series GPU but **fails at runtime on the project's jax**
+  (`UNIMPLEMENTED: default_memory_space is not supported`, jax 0.10) — even a plain jitted loop.
+  It executes only on a legacy stack (jax 0.4.34 + jax-metal 0.1.1, Python 3.11), which the
+  project cannot adopt.  The Neural Engine is not a JAX target at all.  So OSQP remains the only
+  backend; revisit PGD only for a CUDA deployment at large `R`.
 
 ## 12. Testing plan (mirror `tests/`)
 
