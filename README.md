@@ -111,6 +111,28 @@ where `G` is the number of random coefficient characteristics.
 
 **Diversion:** Integrated over individuals: `D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ]`, evaluated at xi=0.
 
+### Fixed-Grid Nonparametric (FKRB / HHO)
+
+Relax the independent-normal random-coefficient distribution: estimate a *nonparametric* mixing distribution on a fixed grid of deviation vectors (Fox–Kim–Ryan–Bajari 2011; Heiss–Hetzenecker–Osterhaus 2022). This is a second stage on a fitted `RandomCoefficients` — it holds the step-1 mean utilities fixed and recovers grid weights by cross-validated nonnegative elastic net.
+
+```python
+from logit_mle import RandomCoefficients, FixedGridRC
+
+rc    = RandomCoefficients(avail, q_jt, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=True)
+step1 = rc.fit(seed=2025)
+
+fg  = FixedGridRC.from_fitted(rc, step1)        # grid auto-built from sigma_hat
+res = fg.fit(select="one_se")                   # CV over mu, folding over markets
+
+D_np        = res.diversion_matrix()            # nonparametric f(beta)
+D_normal    = rc.diversion_matrix(step1.x)      # normal-RC, for comparison
+beta, theta = res.f_beta()                      # the estimated mixing distribution
+```
+
+Requires the `hho` extra for `cvxpy` (`uv pip install -e ".[hho]"`). Construct from raw arrays (`FixedGridRC(delta_hat, sigma_hat, xi_hat, x2=..., availability_matrix=..., q_jt=...)`) or via `from_fitted`. Hold characteristics out of the grid (homogeneous) with `drop_cols=(price_col,)`. The result delegates `shares()` / `diversion_matrix()` / `elasticity_matrix()` to the existing `RandomCoefficients` machinery (grid as nodes, `theta` as weights), so it is directly comparable to the normal-RC run. See [`docs/hho_design.md`](docs/hho_design.md).
+
+**Notes.** Identification needs many markets with real cross-market variation (assortment or price). Diversion is robust, but the raw grid weights are non-unique on a dense grid without regularization (`mu > 0`). Solver is cvxpy/OSQP; cost is factorization-bound (fine for `R <= ~500`).
+
 ## Market fixed effects
 
 All models support `market_fe=True`, which adds market-varying outside good utility `xi_t` (Berry 1994). This captures market-level variation in the attractiveness of not purchasing.
