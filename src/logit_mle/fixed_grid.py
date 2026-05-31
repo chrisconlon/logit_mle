@@ -24,7 +24,8 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from .random_coefficients import _s_ijt
+from .random_coefficients import RandomCoefficients, _s_ijt, _s_jt, _diversion_jk
+from .quadrature import beta_grid_box
 
 
 def grid_to_rc_inputs(beta_grid, drop_cols, G):
@@ -312,7 +313,10 @@ def cross_validate_mu(
     CVResult
     """
     if mu_grid is None:
-        mu_grid = np.r_[0.0, np.logspace(-6.0, 1.0, 50)]
+        # 25 points incl. mu=0 (FKRB). Kept modest: each solve re-factorizes an R×R
+        # KKT (factorization-bound), so cost is linear in the number of mu points;
+        # 25 is ample for one-SE selection.
+        mu_grid = np.r_[0.0, np.logspace(-6.0, 1.0, 24)]
     mu_grid = np.unique(np.asarray(mu_grid, dtype=float))      # sorted ascending
     solver_opts = solver_opts or {}
 
@@ -372,3 +376,211 @@ def cross_validate_mu(
         theta_hat=theta_hat,
         per_fold_oos_mse=per_fold,
     )
+
+
+# ── Step 4: public estimator + result ────────────────────────────
+
+class FixedGridRC:
+    """Fixed-grid nonparametric random-coefficient estimator (FKRB / HHO).
+
+    Second stage on a fitted ``RandomCoefficients``: holds the step-1 mean
+    utilities ``(delta, xi)`` fixed and recovers a nonparametric mixing
+    distribution over a fixed grid of deviation vectors by cross-validated
+    nonnegative elastic net.  Construct from raw step-1 arrays, or from a fitted
+    model via :meth:`from_fitted`.
+    """
+
+    def __init__(
+        self,
+        delta_hat,
+        sigma_hat,
+        xi_hat=None,
+        *,
+        x2,
+        availability_matrix,
+        q_jt,
+        market_fe=False,
+        beta_grid=None,
+        drop_cols=(),
+        grid_size=200,
+        span=3.0,
+        grid_seed=0,
+        solver="cvxpy",
+    ):
+        """
+        Parameters
+        ----------
+        delta_hat : array, shape (J-1,) or (J,)
+            Step-1 mean utilities.  If length ``J`` the outside good (last) is
+            dropped (it is normalized to 0).
+        sigma_hat : array, shape (G,)
+            Step-1 RC std devs; used only to size the default grid.
+        xi_hat : array, shape (T,) or (T-1,), optional
+            Step-1 per-market outside-good utility (last market normalized to 0).
+            Ignored when ``market_fe=False`` (treated as zeros).
+        x2 : array, shape (J, G)
+        availability_matrix : array, shape (J, T)
+        q_jt : array, shape (J, T)
+            Observed purchase counts (-> observed shares ``q / q.sum(0)``).
+        market_fe : bool
+        beta_grid : array, shape (R, G_grid), optional
+            Deviation grid over the gridded columns.  If None, built with
+            :func:`beta_grid_box` from ``sigma_hat[keep]`` (``grid_size`` points,
+            half-width ``span * sigma``).
+        drop_cols : tuple[int]
+            Characteristics held homogeneous (excluded from the grid).
+        grid_size, span, grid_seed :
+            Default-grid controls (used only when ``beta_grid is None``).
+        solver : str
+            Step-2 QP backend ("cvxpy").
+        """
+        self.x2 = np.asarray(x2, dtype=float)
+        self.avail = np.asarray(availability_matrix)
+        self.q_jt = np.asarray(q_jt, dtype=float)
+        self.J, self.T = self.avail.shape
+        self.G = self.x2.shape[1]
+        self.market_fe = bool(market_fe)
+        self.drop_cols = tuple(drop_cols)
+        self.solver = solver
+
+        delta_hat = np.asarray(delta_hat, dtype=float)
+        if delta_hat.shape[0] == self.J:          # drop normalized outside good
+            delta_hat = delta_hat[: self.J - 1]
+        elif delta_hat.shape[0] != self.J - 1:
+            raise ValueError(
+                f"delta_hat must have length J-1={self.J - 1} or J={self.J}, "
+                f"got {delta_hat.shape[0]}"
+            )
+        self.delta_inside = delta_hat
+
+        self.sigma_hat = np.asarray(sigma_hat, dtype=float)
+        self.xi = self._normalize_xi(xi_hat)
+
+        keep = [g for g in range(self.G) if g not in self.drop_cols]
+        if beta_grid is None:
+            beta_grid = beta_grid_box(
+                self.sigma_hat[keep], grid_size, span=span, seed=grid_seed
+            )
+        self.beta_grid = np.asarray(beta_grid, dtype=float)
+
+    def _normalize_xi(self, xi_hat):
+        """Return ξ as a length-T vector (zeros if no market FE; last = 0)."""
+        if not self.market_fe:
+            return np.zeros(self.T)
+        if xi_hat is None:
+            return np.zeros(self.T)
+        xi_hat = np.asarray(xi_hat, dtype=float)
+        if xi_hat.shape[0] == self.T:
+            return xi_hat
+        if xi_hat.shape[0] == self.T - 1:
+            return np.append(xi_hat, 0.0)
+        raise ValueError(
+            f"xi_hat must have length T={self.T} or T-1={self.T - 1}, "
+            f"got {xi_hat.shape[0]}"
+        )
+
+    @classmethod
+    def from_fitted(cls, rc_model, step1_result, *, beta_grid=None, drop_cols=(),
+                    grid_size=200, span=3.0, grid_seed=0, solver="cvxpy"):
+        """Build from a fitted ``RandomCoefficients`` and its ``OptimizeResult``."""
+        p = rc_model._unpack_theta(np.asarray(step1_result.x))
+        return cls(
+            np.asarray(p["delta_inside"]),
+            np.asarray(p["sigma"]),
+            np.asarray(p["xi"]),
+            x2=np.asarray(rc_model.x2),
+            availability_matrix=np.asarray(rc_model.availability_matrix),
+            q_jt=np.asarray(rc_model.q_jt),
+            market_fe=rc_model.market_fe,
+            beta_grid=beta_grid,
+            drop_cols=drop_cols,
+            grid_size=grid_size,
+            span=span,
+            grid_seed=grid_seed,
+            solver=solver,
+        )
+
+    def fit(self, *, mu_grid=None, k=10, train_pct=0.9, random_state=2025,
+            select="one_se", solver_opts=None):
+        """Cross-validate ``mu`` and refit on all markets.  Returns a FixedGridResult."""
+        cv = cross_validate_mu(
+            self.delta_inside, self.xi, self.x2, self.beta_grid, self.avail, self.q_jt,
+            drop_cols=self.drop_cols, mu_grid=mu_grid, k=k, train_pct=train_pct,
+            random_state=random_state, select=select, solver_opts=solver_opts,
+        )
+        return FixedGridResult(
+            delta_inside=self.delta_inside, xi=self.xi, x2=self.x2, avail=self.avail,
+            q_jt=self.q_jt, beta_grid=self.beta_grid, theta_hat=cv.theta_hat,
+            drop_cols=self.drop_cols, market_fe=self.market_fe, cv=cv,
+        )
+
+
+class FixedGridResult:
+    """A fitted nonparametric mixing distribution ``{(beta_r, theta_r)}``.
+
+    Downstream objects reuse the existing ``RandomCoefficients`` machinery with
+    the grid as integration nodes and ``theta_hat`` as weights, so they are
+    directly comparable to the normal-RC run.
+    """
+
+    def __init__(self, *, delta_inside, xi, x2, avail, q_jt, beta_grid, theta_hat,
+                 drop_cols, market_fe, cv):
+        self.delta_inside = np.asarray(delta_inside)
+        self.xi = np.asarray(xi)
+        self.x2 = np.asarray(x2)
+        self.avail = np.asarray(avail)
+        self.q_jt = np.asarray(q_jt)
+        self.beta_grid = np.asarray(beta_grid)
+        self.theta_hat = np.asarray(theta_hat)
+        self.drop_cols = tuple(drop_cols)
+        self.market_fe = bool(market_fe)
+        self.cv = cv
+        self.mu_selected = cv.mu_selected
+        self.J, self.T = self.avail.shape
+        self.G = self.x2.shape[1]
+        self.sigma_vec, self.nu_full = grid_to_rc_inputs(
+            self.beta_grid, self.drop_cols, self.G
+        )
+        self._rc_cache = None
+
+    def f_beta(self):
+        """The estimated mixing distribution: ``(beta_grid, theta_hat)``."""
+        return self.beta_grid, self.theta_hat
+
+    def shares(self):
+        """Predicted market shares under the nonparametric f(beta). Shape (J, T)."""
+        s = _s_jt(self.delta_inside, self.sigma_vec, self.xi, self.x2,
+                  self.nu_full, self.theta_hat, self.avail)
+        return np.asarray(s)
+
+    def diversion_matrix(self):
+        """Diversion ratios at the xi=0 baseline, full availability. Shape (J, J)."""
+        avail_full = jnp.ones((self.J, self.T), dtype=bool)
+        D = _diversion_jk(self.delta_inside, self.sigma_vec, self.x2,
+                          self.nu_full, self.theta_hat, avail_full)
+        return np.asarray(D)
+
+    def to_random_coefficients(self):
+        """Return ``(rc, theta_vec)``: an equivalent RandomCoefficients + its theta.
+
+        The mixing distribution is represented as integration nodes ``nu_full``
+        with weights ``theta_hat`` and ``sigma`` the gridded/dropped indicator.
+        """
+        if self._rc_cache is None:
+            rc = RandomCoefficients(
+                self.avail, self.q_jt, x2=self.x2,
+                nu_i=np.asarray(self.nu_full), w_i=np.asarray(self.theta_hat),
+                market_fe=self.market_fe,
+            )
+            parts = [np.asarray(self.delta_inside), np.asarray(self.sigma_vec)]
+            if self.market_fe:
+                parts.append(np.asarray(self.xi[:-1]))   # inside xi (last normalized)
+            self._rc_cache = (rc, np.concatenate(parts))
+        return self._rc_cache
+
+    def elasticity_matrix(self, *, prices, price_coeff, price_col=None):
+        """Price elasticity matrix under the nonparametric f(beta). Shape (J, J)."""
+        rc, theta_vec = self.to_random_coefficients()
+        return np.asarray(rc.elasticity_matrix(
+            theta_vec, prices=prices, price_coeff=price_coeff, price_col=price_col
+        ))

@@ -15,7 +15,10 @@ Two things are validated here, before any solver is wired up:
 import numpy as np
 import pytest
 
-from logit_mle import RandomCoefficients, beta_grid_box, build_design_matrix
+from logit_mle import (
+    RandomCoefficients, beta_grid_box, build_design_matrix, halton_draws,
+    FixedGridRC, FixedGridResult,
+)
 from logit_mle.fixed_grid import (
     grid_to_rc_inputs, solve_qp, make_market_folds, cross_validate_mu,
 )
@@ -31,7 +34,11 @@ def make_problem(J_in=6, T=3, G=3, R=40, *, drop_cols=(),
     x2 = rng.randn(J, G)
     x2[J - 1] = 0.0                                   # outside good characteristics = 0
     delta_inside = rng.uniform(-3.0, -1.0, J_in)
-    xi = rng.uniform(-1.0, 1.0, T) if nonzero_xi else np.zeros(T)  # outside-good utility
+    if nonzero_xi:
+        xi = rng.uniform(-1.0, 1.0, T)
+        xi[-1] = 0.0                                  # last market normalized (RC convention)
+    else:
+        xi = np.zeros(T)
     avail = np.ones((J, T), dtype=bool)
     if partial_avail:
         # drop a few inside goods in some markets; outside good stays available.
@@ -302,3 +309,143 @@ def test_cross_validate_mu_reproducible():
                           p["avail"], q, **kw)
     np.testing.assert_array_equal(a.per_fold_oos_mse, b.per_fold_oos_mse)
     assert a.mu_selected == b.mu_selected
+
+
+# ── Step-4 public class: FixedGridRC / FixedGridResult ──────────
+
+_SMALL_MU = np.r_[0.0, np.logspace(-4, 0, 5)]
+
+
+def _fit_small(p, **fit_kw):
+    fg = FixedGridRC(p["delta_inside"], p["sigma_hat"], p["xi"],
+                     x2=p["x2"], availability_matrix=p["avail"], q_jt=_planted_q_jt(p),
+                     market_fe=True, beta_grid=p["beta_grid"])
+    return fg.fit(k=4, mu_grid=_SMALL_MU, random_state=1, **fit_kw)
+
+
+def test_fixedgridrc_raw_runs():
+    pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=20, G=3, R=25, nonzero_xi=True, seed=4)
+    res = _fit_small(p)
+    assert isinstance(res, FixedGridResult)
+    s = res.shares()
+    assert s.shape == (p["J"], p["T"])
+    np.testing.assert_allclose(s.sum(axis=0), 1.0, atol=1e-9)
+    assert res.diversion_matrix().shape == (p["J"], p["J"])
+    assert np.all(res.theta_hat >= -1e-12)
+    np.testing.assert_allclose(res.theta_hat.sum(), 1.0, atol=1e-9)
+    assert res.mu_selected in res.cv.mu_grid
+
+
+def test_fixedgridresult_shares_match_mixture():
+    pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=18, G=3, R=20, nonzero_xi=True, seed=8)
+    res = _fit_small(p)
+    Z, _ = build_design_matrix(p["delta_inside"], p["xi"], p["x2"], p["beta_grid"],
+                               p["avail"], drop_cols=())
+    mixture = (np.asarray(Z) @ res.theta_hat).reshape(p["J"], p["T"])
+    np.testing.assert_allclose(res.shares(), mixture, atol=1e-9)
+
+
+def test_fixedgridresult_reuse_matches_random_coefficients():
+    # shares() and diversion_matrix() equal the RandomCoefficients representation
+    # (nu_i = nu_full, w_i = theta_hat, sigma = sigma_vec) -- the (nodes, weights) reuse.
+    pytest.importorskip("cvxpy")
+    p = make_problem(J_in=6, T=18, G=3, R=20, nonzero_xi=True, seed=8)
+    res = _fit_small(p)
+    rc, theta_vec = res.to_random_coefficients()
+    np.testing.assert_allclose(
+        res.shares(),
+        np.asarray(rc._compute_shares(theta_vec, rc.availability_matrix)),
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        res.diversion_matrix(), np.asarray(rc.diversion_matrix(theta_vec)), atol=1e-10
+    )
+
+
+def test_from_fitted_runs():
+    # Quick RC fit, then the fixed-grid second stage from the fitted model.
+    pytest.importorskip("cvxpy")
+    rng = np.random.RandomState(0)
+    J_in, T, G = 5, 16, 2
+    J = J_in + 1
+    avail = np.ones((J, T), dtype=bool)
+    x2 = rng.randn(J, G)
+    x2[J - 1] = 0.0
+    nu_i, w_i = halton_draws(G, 200, seed=0)
+
+    rc0 = RandomCoefficients(avail, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=False)
+    theta_true = np.concatenate([rng.uniform(-2.0, -1.0, J_in), np.array([0.4, 0.6])])
+    q = np.asarray(rc0._compute_shares(theta_true, avail))   # synthetic shares as counts
+
+    rc = RandomCoefficients(avail, q, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=False)
+    step1 = rc.fit(seed=1, verbose=False)
+
+    fg = FixedGridRC.from_fitted(rc, step1, grid_size=60, span=3.0)
+    res = fg.fit(k=4, mu_grid=np.r_[0.0, np.logspace(-3, 0, 5)], random_state=1)
+    assert res.shares().shape == (J, T)
+    np.testing.assert_allclose(res.shares().sum(axis=0), 1.0, atol=1e-9)
+    np.testing.assert_allclose(res.theta_hat.sum(), 1.0, atol=1e-9)
+
+
+# ── Step-5 capstone: normal recovery ────────────────────────────
+
+def test_normal_recovery_capstone():
+    """When the DGP is normal-RC, the nonparametric fixed-grid diversion matches the
+    fitted normal-RC diversion (and tracks the truth) -- going nonparametric does not
+    distort substitution.
+
+    Only product assortment (availability) varies across markets here -- the cleanest
+    identifying variation, and the favorable case (characteristics fixed, no prices, no
+    market FE).  Data are noiseless, so recovery is near-exact.  With sampling noise these
+    estimators need many markets to converge (see docs/hho_design.md, identification note).
+    """
+    pytest.importorskip("cvxpy")
+    rng = np.random.RandomState(0)
+    J_in, T, G = 8, 60, 2
+    J = J_in + 1
+
+    x2 = rng.randn(J, G)
+    x2[J - 1] = 0.0
+    avail = rng.rand(J, T) < 0.85
+    avail[J - 1, :] = True                                  # outside always available
+    for t in range(T):                                     # >= 2 inside goods per market
+        if avail[: J - 1, t].sum() < 2:
+            avail[rng.choice(J - 1, 2, replace=False), t] = True
+
+    # True normal-RC DGP -> observed shares (as counts) and true diversion.
+    nu_i, w_i = halton_draws(G, 800, seed=1)
+    truth = RandomCoefficients(avail, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=False)
+    theta_true = np.concatenate([rng.uniform(-2.5, -1.0, J_in), np.array([1.0, 0.7])])
+    q = np.asarray(truth._compute_shares(theta_true, avail))
+    D_true = np.asarray(truth.diversion_matrix(theta_true))
+
+    # Step 1: fit normal RC.
+    rc = RandomCoefficients(avail, q, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=False)
+    step1 = rc.fit(seed=2, verbose=False)
+    D_normal = np.asarray(rc.diversion_matrix(step1.x))
+
+    # Step 2: nonparametric fixed grid.
+    fg = FixedGridRC.from_fitted(rc, step1, grid_size=150, span=4.0, grid_seed=0)
+    res = fg.fit(k=5, mu_grid=np.r_[0.0, np.logspace(-8, -1, 20)],
+                 random_state=3, select="argmin")
+    D_np = res.diversion_matrix()
+
+    off = ~np.eye(J, dtype=bool)
+
+    def corr(a, b):
+        return float(np.corrcoef(a[off], b[off])[0, 1])
+
+    print(f"\ncorr(np, normal)={corr(D_np, D_normal):.4f}  "
+          f"corr(np, true)={corr(D_np, D_true):.4f}  "
+          f"corr(normal, true)={corr(D_normal, D_true):.4f}")
+    print(f"MAD(np, normal)={np.mean(np.abs(D_np[off] - D_normal[off])):.5f}  "
+          f"MAD(np, true)={np.mean(np.abs(D_np[off] - D_true[off])):.5f}")
+
+    # Nonparametric matches the fitted normal diversion, and tracks the truth.
+    # (Noiseless normal data + availability identification -> near-exact recovery;
+    # thresholds keep wide margin over the observed corr~1.0, MAD~3e-5.)
+    assert corr(D_np, D_normal) > 0.99
+    assert np.mean(np.abs(D_np[off] - D_normal[off])) < 0.005
+    assert corr(D_np, D_true) > 0.99

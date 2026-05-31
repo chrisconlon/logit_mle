@@ -89,7 +89,8 @@ class FixedGridRC:
 
     def __init__(self, delta_hat, sigma_hat, xi_hat=None, *,
                  x2, availability_matrix, q_jt, market_fe=False,
-                 beta_grid=None, drop_cols=(), solver="cvxpy"):
+                 beta_grid=None, drop_cols=(),
+                 grid_size=200, span=3.0, grid_seed=0, solver="cvxpy"):
         """
         delta_hat           : (J-1,) step-1 inside-good mean utilities (offset, held fixed)
         sigma_hat           : (G,)   step-1 RC std devs (used only to locate the grid)
@@ -102,6 +103,7 @@ class FixedGridRC:
                               built from sigma_hat[keep] (Section 6)
         drop_cols           : tuple[int] columns of x2 held homogeneous (no grid dim;
                               deviation fixed at 0) -- e.g. the price column
+        grid_size,span,grid_seed : default-grid controls (only when beta_grid is None)
         solver              : "cvxpy" (default); behind the _solve_qp interface (Section 5.4)
         """
 
@@ -116,9 +118,9 @@ class FixedGridRC:
                    q_jt=rc_model.q_jt, market_fe=rc_model.market_fe,
                    beta_grid=beta_grid, drop_cols=drop_cols, solver=solver)
 
-    def fit(self, *, mu_grid=None, n_folds=10, fold_axis="market",
+    def fit(self, *, mu_grid=None, k=10, train_pct=0.9, random_state=2025,
             select="one_se", solver_opts=None) -> "FixedGridResult":
-        """Build Z, cross-validate mu, refit on all data, return the distribution object."""
+        """Cross-validate mu (folding over markets), refit on all markets, return the result."""
 ```
 
 `FixedGridResult` stores `delta_hat, xi_hat, beta_grid, theta_hat, mu_hat, drop_cols, cv_curve`
@@ -197,8 +199,9 @@ implement the same signature without touching the rest; not needed at current sc
 
 ### 5.5 Cross-validate `mu` (`cross_validate_mu`)
 
-- `mu_grid`: ascending, default `np.r_[0.0, np.logspace(-6, 1, 50)]` — the `0.0` endpoint is
-  the FKRB special case.
+- `mu_grid`: ascending, default `np.r_[0.0, np.logspace(-6, 1, 24)]` (25 points) — the `0.0`
+  endpoint is the FKRB special case.  Kept modest because each `mu` re-factorizes an R×R KKT,
+  so CV cost is linear in the number of `mu` points (see §11); 25 is ample for one-SE.
 - Folds (`make_market_folds`, PyCMS `create_kfolds` style): `k` *repeated random* train/test
   splits **over markets** — each draws a `train_pct` (default 0.9) fraction of the `T` markets
   without replacement (seed `random_state + fold`), complement = test.  Not a disjoint
@@ -318,8 +321,42 @@ beta_grid, theta_hat = res.f_beta()        # the estimated mixing distribution
    random `train_pct` splits (PyCMS `create_kfolds` style), not a disjoint partition.  Assumes
    markets are exchangeable enough to subsample — fine at the hotel/simulation scale (large
    `T`); revisit only if `T` is small.
+5. **Identification needs many markets.** The second stage estimates `R` weights from
+   cross-market variation in observed shares, so it needs \(T\) large relative to \(J\) (and
+   the grid `R`) — the aggregate analogue of FKRB/HHO's many-observations regime, and the same
+   \(T \gg J\) regime the Compiani–Christensen de-biasing requires.  In simulation with
+   *noiseless* shares even small \(T\) recovers; with sampling noise (finite consumers per
+   market) recovery degrades sharply at small \(T\) and converges only as \(T\) grows (e.g.
+   corr-with-truth ~0.86 at \(T=6\) vs ~0.99 at \(T\ge 60\), \(J=9\)), and the nonparametric
+   estimator converges *slower* than the correctly-specified normal (it pays a variance cost
+   for flexibility).  **What must vary across markets is the identifying variation** — product
+   assortment (availability) and/or price/\(\xi\).  The capstone uses assortment variation (the
+   cleanest case); the hotel application has ~fixed assortment and relies on price/time
+   variation, which is weaker — consistent with the paper's "lack of choice-set variation."
 
-## 11. Testing plan (mirror `tests/`)
+## 11. Performance and solver scaling
+
+- **Cost is factorization-bound.** Each `mu` solve re-factorizes a dense \(R \times R\) KKT
+  system (the ridge enters as `P = Gram + mu*I`, a diagonal change OSQP cannot reuse a
+  factorization across).  Per-solve scales ~\(R^{2.7}\): ~7 ms at `R=250`, ~37 ms at `R=500`,
+  ~220 ms at `R=1000`, ~1.4 s at `R=2000` (`JT=5000`).  A full CV (`k=10`, 25 `mu`) is well
+  under ~20 s for `R<=500`, ~1 min at `R=1000`.  Building `Z`/`Gram` is negligible by
+  comparison.
+- **Loosening tolerance does *not* help** — `eps` from `1e-9` to `1e-4` leaves sweep time
+  unchanged (it's the factorization, not iteration count, that dominates).  Warm-start and the
+  DPP parameterization help iterations, so their benefit also shrinks as `R` grows.
+- **OSQP is the default and is faster than Clarabel** here (≈2× at `R=250`, ≈1.3× at `R=1000`),
+  and the two agree to ~1e-5 on `theta` (a useful correctness cross-check).  Use **Clarabel**
+  (`solver=cp.CLARABEL`) as a fallback when `Gram` is near-singular (very dense grid,
+  \(R \to JT\)) where interior-point is more robust than ADMM, or for a high-accuracy final
+  refit.
+- **Levers if `R` grows large** (in order): fewer `mu` points / adaptive search; a coarser
+  `beta` grid (the curse of dimensionality caps `R` in the low hundreds anyway); then the
+  pure-JAX projected-gradient backend (gradient `(Gram+mu*I)theta - b` is an \(O(R^2)\) matvec,
+  no factorization, GPU-batchable across `mu`), which slots behind the existing `_solve_qp`
+  `backend` switch.
+
+## 12. Testing plan (mirror `tests/`)
 
 - **FKRB special case:** at `mu = 0`, `_solve_qp` reproduces a reference simplex-constrained
   NNLS (cross-check against `scipy.optimize.nnls` projected to the simplex, or an `osqp`
@@ -335,7 +372,7 @@ beta_grid, theta_hat = res.f_beta()        # the estimated mixing distribution
   `(nu_i=beta_grid, w_i=theta_hat, sigma=ones)` — confirms the `(nodes, weights)` reuse.
 - **Solver interface:** `cvxpy` and (later) `pgd` backends agree to tolerance on a small QP.
 
-## 12. References
+## 13. References
 
 - Heiss, F., Hetzenecker, S., Osterhaus, M. (2022). "Nonparametric estimation of the random
   coefficients model: An elastic net approach." *Journal of Econometrics* 229(2), 299–321.
