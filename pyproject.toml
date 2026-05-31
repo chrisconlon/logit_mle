@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 sparse = ["chaospy"]
 hho = ["cvxpy"]
+examples = ["matplotlib", "jupytext", "ipykernel", "nbconvert"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

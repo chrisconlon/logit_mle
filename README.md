@@ -19,6 +19,14 @@ uv pip install -e ".[sparse]"
 
 Requires Python 3.10+ and JAX.
 
+## Tutorial
+
+A full, runnable walkthrough — data format, integration rules, mixed-logit MLE, nested logit, the HHO nonparametric estimator (with cross-validated regularization), and reading off diversion/elasticities, all against a known simulated truth — is in [`examples/tutorial.ipynb`](examples/tutorial.ipynb). To run it (needs the `hho` + `examples` extras):
+
+```bash
+uv run --with ".[hho,examples]" jupytext --to notebook --execute examples/tutorial.py
+```
+
 ## Models
 
 All models share a common base class `DiscreteChoiceModel` with a unified interface:
