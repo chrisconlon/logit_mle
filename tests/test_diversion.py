@@ -234,3 +234,40 @@ class TestRandomCoefficientsDiversion:
                 expected = s[k] / (1.0 - s[j])
                 np.testing.assert_allclose(D_rc[j, k], expected, atol=1e-6,
                     err_msg=f"RC(sigma=0): D[{j},{k}] should match logit IIA")
+
+    @pytest.mark.parametrize("sigma_scale", [0.3, 3.0])
+    def test_matches_individual_tensor_form(self, sigma_scale):
+        """The matrix-product diversion equals the explicit (I, J, J) tensor form,
+        diagonal included, with market FE and several markets; gradients agree."""
+        from logit_mle.random_coefficients import _s_ijt
+        rng = np.random.RandomState(7)
+        J_in, G, I, T = 9, 3, 200, 5
+        J = J_in + 1
+        avail = rng.rand(J, T) < 0.8
+        avail[-1] = True
+        x2 = rng.randn(J, G)
+        x2[-1] = 0.0
+        nu_i = rng.randn(I, G)
+        w_i = rng.rand(I)
+        w_i /= w_i.sum()
+        q = rng.randint(1, 50, (J, T)).astype(float)
+        theta = jnp.array(np.concatenate([rng.randn(J_in) * 0.5 - 2.0,
+                                          np.abs(rng.randn(G)) * sigma_scale,
+                                          rng.randn(T - 1) * 0.3]))
+        model = RandomCoefficients(avail, q, x2=x2, nu_i=nu_i, w_i=w_i, market_fe=True)
+
+        def tensor_form(th):
+            p = model._unpack_theta(th)
+            S = _s_ijt(p["delta_inside"], p["sigma"], jnp.zeros(T), model.x2, model.nu_i,
+                       jnp.ones((J, T), dtype=bool))[:, :, 0]
+            s = model.w_i @ S
+            D_ijk = (S[:, None, :] / (1.0 - S[:, :, None])) * (S[:, :, None] / s[None, :, None])
+            return jnp.sum(model.w_i[:, None, None] * D_ijk, axis=0)
+
+        np.testing.assert_allclose(np.array(model.diversion_matrix(theta)),
+                                   np.array(tensor_form(theta)), rtol=1e-12, atol=1e-14)
+
+        weights = jnp.array(rng.rand(J, J))
+        g_new = jax.grad(lambda th: jnp.sum(weights * model._compute_diversion(th)))(theta)
+        g_ref = jax.grad(lambda th: jnp.sum(weights * tensor_form(th)))(theta)
+        np.testing.assert_allclose(np.array(g_new), np.array(g_ref), rtol=1e-10, atol=1e-12)

@@ -82,28 +82,20 @@ def _s_jt(delta_inside, sigma, xi, x_jg, nu_i, w_i, availability_matrix):
 
 @jax.jit
 def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full):
-    """Diversion D_jk at xi=0. Shape (J, J)."""
-    T = availability_matrix_full.shape[1]
-    xi_zero = jnp.zeros(T)
-    S_ijt = _s_ijt(delta_inside, sigma, xi_zero, x_jg, nu_i, availability_matrix_full)
+    """Diversion D_jk at xi=0. Shape (J, J).
+
+    D_jk = (1/s_j) sum_i w_i s_ij s_ik / (1 - s_ij), computed as one matrix
+    product rather than by materializing the (I, J, J) individual-level tensor,
+    and on a single market (all markets are identical at xi=0 under full
+    availability). Same values, diagonal included.
+    """
+    avail_one = availability_matrix_full[:, :1]
+    S_ij = _s_ijt(delta_inside, sigma, jnp.zeros(1), x_jg, nu_i, avail_one)[:, :, 0]  # (I, J)
     I = w_i.shape[0]
-    S_jt = jnp.sum(w_i.reshape(I, 1, 1) * S_ijt, axis=0)
+    S_j = w_i @ S_ij                                    # (J,)
 
-    # Use market 0 (all markets identical at xi=0 under full availability)
-    S_ij = S_ijt[:, :, 0]  # (I, J)
-    S_j = S_jt[:, 0]       # (J,)
-
-    J = S_j.shape[0]
-
-    s_ij_re = S_ij.reshape(I, J, 1)
-    s_ik_re = S_ij.reshape(I, 1, J)
-    s_j_re = S_j.reshape(1, J, 1)
-
-    # Individual-level diversion
-    D_ijk = (s_ik_re / (1.0 - s_ij_re)) * (s_ij_re / s_j_re)
-
-    # Integrate over individuals
-    D_jk = jnp.sum(w_i.reshape(I, 1, 1) * D_ijk, axis=0)  # (J, J)
+    A = w_i.reshape(I, 1) * S_ij / (1.0 - S_ij)         # (I, J)
+    D_jk = (A.T @ S_ij) / S_j.reshape(-1, 1)            # (J, J)
 
     return D_jk
 
