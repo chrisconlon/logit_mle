@@ -124,10 +124,18 @@ def _diversion_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_fu
     sg = s_g[g_of_in]
 
     # K_j = (1 - s_g) + s_g * (1 - s_{j|g})^{1-rho}
-    DELTA = (1.0 - sg) + sg * (1.0 - sgj) ** (1.0 - rho)
+    # When j is alone in its nest, s_{j|g} = 1: removing j removes the nest, so
+    # D_jk = s_k / (1 - s_j) for every k (the across-nest term with s_g = s_j) and
+    # the within-nest term has no other product to apply to. Evaluate the powers
+    # of (1 - s_{j|g}) at a safe base there, so neither the values nor the
+    # gradients pick up 0^rho or log(0), and set the within-nest term to 0.
+    rest = 1.0 - sgj
+    has_rest = rest > 0.0
+    safe_rest = jnp.where(has_rest, rest, 1.0)
+    DELTA = (1.0 - sg) + sg * jnp.where(has_rest, safe_rest ** (1.0 - rho), 0.0)
     aj = 1.0 / DELTA - 1.0                                # tau_out - 1
-    cj = 1.0 / (DELTA * (1.0 - sgj) ** rho) - 1.0         # tau_in - 1
-    bj = cj - aj
+    cj = 1.0 / (DELTA * safe_rest ** rho) - 1.0           # tau_in - 1
+    bj = jnp.where(has_rest, cj - aj, 0.0)
 
     M = (g_of_in[:, None] == g_of_all[None, :]).astype(s_j.dtype)  # (J_in, J)
     ratio = s_j[None, :] / s_j[:J_in][:, None]                     # (J_in, J)

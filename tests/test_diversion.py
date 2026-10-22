@@ -119,6 +119,44 @@ class TestLogitDiversion:
                     err_msg=f"Logit IIA: D[{j},{k}] wrong")
 
 
+class TestNestedLogitSingletonNest:
+    """A product alone in its nest has s_{j|g} = 1; removing it removes the nest,
+    so D_jk = s_k / (1 - s_j). The closed form used to return NaN for that row."""
+
+    @staticmethod
+    def model_and_theta(rho, seed=5):
+        rng = np.random.RandomState(seed)
+        ids = np.array([0, 0, 0, 1, 2, 2, 3])          # products 3 and 6 are alone in their nests
+        J = len(ids) + 1
+        theta = jnp.array(np.concatenate([rng.randn(len(ids)) * 0.5 - 1.0, [rho]]))
+        return NestedLogit(np.ones((J, 1), dtype=bool), nesting_ids=ids), theta, J
+
+    @pytest.mark.parametrize("rho", [0.0, 0.3, 0.7])
+    def test_removal_matches_formula(self, rho):
+        model, theta, J = self.model_and_theta(rho)
+        D_formula = np.array(model.diversion_matrix(theta))
+        assert np.all(np.isfinite(D_formula))
+        np.fill_diagonal(D_formula, 0.0)
+        np.testing.assert_allclose(diversion_by_removal(model, theta, J), D_formula, atol=1e-10)
+
+    @pytest.mark.parametrize("rho", [0.0, 0.3, 0.7])
+    def test_singleton_row_is_logit_over_the_rest(self, rho):
+        model, theta, J = self.model_and_theta(rho)
+        D = np.array(model.diversion_matrix(theta))
+        s = np.array(model.shares(theta)[:, 0])
+        for j in (3, 6):
+            expected = s / (1.0 - s[j])
+            expected[j] = D[j, j]                       # the diagonal is not a diversion
+            np.testing.assert_allclose(D[j], expected, rtol=1e-12)
+
+    @pytest.mark.parametrize("rho", [0.0, 0.3, 0.7])
+    def test_gradients_are_finite(self, rho):
+        model, theta, J = self.model_and_theta(rho)
+        off = 1.0 - jnp.eye(J)
+        g = jax.grad(lambda th: jnp.sum(off * model.diversion_matrix(th)))(theta)
+        assert np.all(np.isfinite(np.array(g)))
+
+
 class TestNestedLogitDiversion:
 
     @pytest.mark.parametrize("rho", [0.25, 0.5, 0.75])
@@ -271,3 +309,27 @@ class TestRandomCoefficientsDiversion:
         g_new = jax.grad(lambda th: jnp.sum(weights * model._compute_diversion(th)))(theta)
         g_ref = jax.grad(lambda th: jnp.sum(weights * tensor_form(th)))(theta)
         np.testing.assert_allclose(np.array(g_new), np.array(g_ref), rtol=1e-10, atol=1e-12)
+
+    def test_saturated_choice_probabilities(self):
+        """When a consumer's top alternative has s_ij that rounds to 1, the plain
+        1 - s_ij is 0. The diversion must stay finite and match product removal."""
+        rng = np.random.RandomState(11)
+        J_in, I = 5, 200
+        J = J_in + 1
+        x2 = np.zeros((J, 1))
+        x2[0, 0] = 3.0                                     # one product with a large taste spread
+        nu_i = rng.randn(I, 1) * 1.5
+        w_i = np.ones(I) / I
+        theta = jnp.array(np.concatenate([rng.randn(J_in) * 0.5 - 1.0, [5.0]]))
+        model = RandomCoefficients(np.ones((J, 1), dtype=bool), x2=x2, nu_i=nu_i, w_i=w_i)
+
+        from logit_mle.random_coefficients import _s_ijt
+        p = model._unpack_theta(theta)
+        S = np.array(_s_ijt(p["delta_inside"], p["sigma"], jnp.zeros(1), model.x2, model.nu_i,
+                            jnp.ones((J, 1), dtype=bool))[:, :, 0])
+        assert np.any(1.0 - S.max(axis=1) == 0.0)         # the test reaches saturation
+
+        D = np.array(model.diversion_matrix(theta))
+        assert np.all(np.isfinite(D))
+        np.fill_diagonal(D, 0.0)
+        np.testing.assert_allclose(D, diversion_by_removal(model, theta, J), rtol=1e-9, atol=1e-12)

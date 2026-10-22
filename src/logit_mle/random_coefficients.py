@@ -90,13 +90,24 @@ def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full
     product rather than by materializing the (I, J, J) individual-level tensor,
     and on a single market (all markets are identical at xi=0 under full
     availability). Same values, diagonal included.
+
+    1 - s_ij is computed stably. For each consumer's most likely alternative it
+    is the sum of the other alternatives' probabilities (all positive, so no
+    cancellation); for the rest, whose s_ij <= 1/2, the subtraction is accurate.
+    The plain subtraction loses relative precision ~eps / (1 - s_ij) and is
+    exactly 0 once one utility beats the rest by about 37, which large sigma
+    can reach during estimation; the sum stays exact until the other
+    probabilities underflow (gaps above ~700).
     """
     avail_one = availability_matrix_full[:, :1]
     S_ij = _s_ijt(delta_inside, sigma, jnp.zeros(1), x_jg, nu_i, avail_one)[:, :, 0]  # (I, J)
     I = w_i.shape[0]
     S_j = w_i @ S_ij                                    # (J,)
 
-    A = w_i.reshape(I, 1) * S_ij / (1.0 - S_ij)         # (I, J)
+    top = jax.nn.one_hot(jnp.argmax(S_ij, axis=1), S_ij.shape[1], dtype=bool)   # (I, J)
+    others = jnp.sum(jnp.where(top, 0.0, S_ij), axis=1, keepdims=True)         # (I, 1)
+    complement = jnp.where(top, others, 1.0 - S_ij)     # 1 - s_ij, stably
+    A = w_i.reshape(I, 1) * S_ij / complement           # (I, J)
     D_jk = (A.T @ S_ij) / S_j.reshape(-1, 1)            # (J, J)
 
     return D_jk
