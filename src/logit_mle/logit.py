@@ -3,11 +3,12 @@ Logit discrete choice model.
 
 Parameters:
   - delta[J-1]: mean utility for inside goods (outside good normalized to 0)
-  - xi[T-1]:    outside good's mean utility per market (only if market_fe=True;
-                last market normalized to 0)
+  - xi[T-1]:    outside good's mean utility per market (only if market_fe=True).
+                The T-th market's xi is implied by xi_normalization: 0 for
+                "last" (the default), or minus the sum of the others for
+                "mean_zero", so the T market effects average to zero.
 
-Diversion: closed-form IIA formula D_jk = s_k / (1 - s_j), evaluated at xi=0, or at
-the point set by `diversion_market` (a market's xi, or the mean of the free xi).
+Diversion: closed-form IIA formula D_jk = s_k / (1 - s_j), evaluated at xi=0.
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from .base import DiscreteChoiceModel
+from .base import DiscreteChoiceModel, complete_xi
 
 
 # ── JAX computation functions ────────────────────────────────────
@@ -43,12 +44,12 @@ def _s_jt(delta_inside, xi, availability_matrix):
 
 
 @jax.jit
-def _diversion_jk(delta_inside, availability_matrix_full, xi_d=0.0):
-    """Closed-form logit diversion at outside utility xi_d (default 0). Shape (J, J)."""
+def _diversion_jk(delta_inside, availability_matrix_full):
+    """Closed-form logit diversion at xi=0. Shape (J, J)."""
     T = availability_matrix_full.shape[1]
-    xi = jnp.zeros(T) + xi_d
-    sjt = _s_jt(delta_inside, xi, availability_matrix_full)
-    s_j = sjt[:, 0]  # all markets identical at a common xi under full availability
+    xi_zero = jnp.zeros(T)
+    sjt = _s_jt(delta_inside, xi_zero, availability_matrix_full)
+    s_j = sjt[:, 0]  # all markets identical at xi=0 under full availability
     J = s_j.shape[0]
 
     D_jk = s_j[None, :] / (1.0 - s_j[:, None])
@@ -61,16 +62,16 @@ def _diversion_jk(delta_inside, availability_matrix_full, xi_d=0.0):
 class Logit(DiscreteChoiceModel):
 
     def __init__(self, availability_matrix, q_jt=None, *, market_fe=False,
-                 diversion_data=None, diversion_market=None):
+                 diversion_data=None, xi_normalization="last"):
         super().__init__(availability_matrix, q_jt, diversion_data=diversion_data,
-                         diversion_market=diversion_market)
+                         xi_normalization=xi_normalization)
         self.market_fe = market_fe
 
     def _unpack_theta(self, theta):
         delta_inside = theta[:self.J - 1]
         delta = jnp.concatenate([delta_inside, jnp.array([0.0])])
         if self.market_fe:
-            xi = jnp.concatenate([theta[self.J - 1:], jnp.array([0.0])])
+            xi = complete_xi(theta[self.J - 1:], self.xi_normalization)
         else:
             xi = jnp.zeros(self.T)
         return {"delta": delta, "delta_inside": delta_inside, "xi": xi}
@@ -81,8 +82,7 @@ class Logit(DiscreteChoiceModel):
 
     def _compute_diversion(self, theta):
         p = self._unpack_theta(theta)
-        return _diversion_jk(p["delta_inside"], self._availability_matrix_full,
-                             self._xi_for_diversion(p["xi"]))
+        return _diversion_jk(p["delta_inside"], self._availability_matrix_full)
 
     def _make_x0(self, rng):
         delta = rng.uniform(-10, -1, self.J - 1)

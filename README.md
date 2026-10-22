@@ -160,7 +160,17 @@ model = RandomCoefficients(availability_matrix, q_jt,
 # theta = (delta[J-1], sigma[G], xi[T-1])
 ```
 
-The last market is the normalization (`xi[T-1] = 0`). Diversion, Jacobian, and elasticity are always evaluated at the `xi = 0` baseline (market-invariant).
+Diversion, Jacobian, and elasticity are evaluated at the `xi = 0` baseline. `xi_normalization` decides which market that is:
+
+- `"last"` (default): the last market's `xi` is 0, so the baseline is that market.
+- `"mean_zero"`: the `T` market effects average to zero (the last one is minus the sum of the others), so the baseline is the average market and there is no reference market.
+
+The two fit the sales identically, since shares depend only on `delta - xi`. They differ when diversion data enter the likelihood (`aug_div=True`). Under `"last"`, the diversion term can set the level of inside against outside utility at the cost of the last market's sales alone. Under `"mean_zero"`, the sales pin the level, and the diversion to the outside good becomes a check rather than a target.
+
+```python
+model = NestedLogit(availability_matrix, q_jt, nesting_ids=ids, market_fe=True,
+                    diversion_data=D, xi_normalization="mean_zero")
+```
 
 ## Elasticities
 
