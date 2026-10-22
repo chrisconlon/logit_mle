@@ -6,7 +6,8 @@ Parameters:
   - xi[T-1]:    outside good's mean utility per market (only if market_fe=True;
                 last market normalized to 0)
 
-Diversion: closed-form IIA formula D_jk = s_k / (1 - s_j), evaluated at xi=0.
+Diversion: closed-form IIA formula D_jk = s_k / (1 - s_j), evaluated at xi=0, or at
+the point set by `diversion_market` (a market's xi, or the mean of the free xi).
 """
 from __future__ import annotations
 
@@ -42,12 +43,12 @@ def _s_jt(delta_inside, xi, availability_matrix):
 
 
 @jax.jit
-def _diversion_jk(delta_inside, availability_matrix_full):
-    """Closed-form logit diversion at xi=0. Shape (J, J)."""
+def _diversion_jk(delta_inside, availability_matrix_full, xi_d=0.0):
+    """Closed-form logit diversion at outside utility xi_d (default 0). Shape (J, J)."""
     T = availability_matrix_full.shape[1]
-    xi_zero = jnp.zeros(T)
-    sjt = _s_jt(delta_inside, xi_zero, availability_matrix_full)
-    s_j = sjt[:, 0]  # all markets identical at xi=0 under full availability
+    xi = jnp.zeros(T) + xi_d
+    sjt = _s_jt(delta_inside, xi, availability_matrix_full)
+    s_j = sjt[:, 0]  # all markets identical at a common xi under full availability
     J = s_j.shape[0]
 
     D_jk = s_j[None, :] / (1.0 - s_j[:, None])
@@ -60,8 +61,9 @@ def _diversion_jk(delta_inside, availability_matrix_full):
 class Logit(DiscreteChoiceModel):
 
     def __init__(self, availability_matrix, q_jt=None, *, market_fe=False,
-                 diversion_data=None):
-        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data)
+                 diversion_data=None, diversion_market=None):
+        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data,
+                         diversion_market=diversion_market)
         self.market_fe = market_fe
 
     def _unpack_theta(self, theta):
@@ -79,7 +81,8 @@ class Logit(DiscreteChoiceModel):
 
     def _compute_diversion(self, theta):
         p = self._unpack_theta(theta)
-        return _diversion_jk(p["delta_inside"], self._availability_matrix_full)
+        return _diversion_jk(p["delta_inside"], self._availability_matrix_full,
+                             self._xi_for_diversion(p["xi"]))
 
     def _make_x0(self, rng):
         delta = rng.uniform(-10, -1, self.J - 1)

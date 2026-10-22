@@ -15,6 +15,34 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 
+def diversion_point(xi, diversion_market):
+    """Outside utility at which diversion is evaluated, from the length-T xi
+    vector (last entry the normalized reference market, 0):
+
+    - None: 0, the reference market (the default);
+    - an int t: xi[t];
+    - "mean": the mean of the free xi, i.e. over every market but the reference
+      (0 when there is only one market).
+
+    A module-level function so jitted objectives can use it without closing over
+    a model. Works on xi / (1 - rho) as well (nested logit, gamma space).
+
+    Why the choice matters for the augmented likelihood: the sales are invariant
+    to adding a constant to every delta and every xi, except through the
+    reference market's own sales. At the reference market (None), the diversion
+    term can therefore set the level of inside against outside utility at the
+    cost of that one market's fit, and it does the same to market t for an int.
+    At "mean", moving the evaluation point through one market costs about T
+    times as much, so the level is pinned by the sales and the experimental
+    diversion to the outside good becomes a check rather than a target.
+    """
+    if diversion_market is None:
+        return 0.0
+    if isinstance(diversion_market, str):
+        return jnp.mean(xi[:-1]) if xi.shape[0] > 1 else 0.0
+    return xi[diversion_market]
+
+
 class DiscreteChoiceModel:
     """Base class for Logit, NestedLogit, and RandomCoefficients models."""
 
@@ -24,9 +52,21 @@ class DiscreteChoiceModel:
         q_jt=None,
         *,
         diversion_data=None,
+        diversion_market=None,
     ):
         self.availability_matrix = jnp.array(availability_matrix)
         self.J, self.T = self.availability_matrix.shape
+        if isinstance(diversion_market, str):
+            if diversion_market != "mean":
+                raise ValueError(f'diversion_market must be None, a market index or "mean", '
+                                 f'not {diversion_market!r}')
+        elif diversion_market is not None:
+            diversion_market = int(diversion_market)
+            if not -self.T <= diversion_market < self.T:
+                raise ValueError(f"diversion_market {diversion_market} is out of range for "
+                                 f"{self.T} markets")
+            diversion_market %= self.T
+        self.diversion_market = diversion_market
         self._availability_matrix_full = jnp.ones((self.J, self.T), dtype=bool)
         self.q_jt = jnp.array(q_jt) if q_jt is not None else None
         self._diversion_data = (
@@ -41,7 +81,13 @@ class DiscreteChoiceModel:
         return self._compute_shares(theta, self.availability_matrix)
 
     def diversion_matrix(self, theta):
-        """Diversion ratios D_jk under full availability. Shape (J, J)."""
+        """Diversion ratios D_jk under full availability. Shape (J, J).
+
+        Evaluated at the outside utility set by ``diversion_market`` (given to
+        the constructor): xi = 0, the reference market whose xi is normalized,
+        when it is None (the default); xi_t for a market index t; or the mean of
+        the free xi for "mean". See :func:`diversion_point`.
+        """
         theta = jnp.asarray(theta)
         return self._compute_diversion(theta)
 
@@ -228,6 +274,10 @@ class DiscreteChoiceModel:
         jac_inside = jax.jacobian(shares_col0)(delta_inside)              # (J, J-1)
         outside_col = -jac_inside.sum(axis=1, keepdims=True)              # (J, 1)
         return jnp.concatenate([jac_inside, outside_col], axis=1)         # (J, J)
+
+    def _xi_for_diversion(self, xi):
+        """Outside utility at which diversion is evaluated; see diversion_point."""
+        return diversion_point(xi, self.diversion_market)
 
     def _theta_with_zero_xi(self, theta):
         """Return theta with the market fixed effects ξ replaced by zero.

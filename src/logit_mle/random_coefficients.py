@@ -10,7 +10,8 @@ Parameters:
                 last market normalized to 0)
 
 Diversion: D_jk = E_i[ s_ik/(1-s_ij) * s_ij/s_j ] integrated over sparse grid,
-evaluated at the xi=0 baseline.
+evaluated at the xi=0 baseline, or at the point set by `diversion_market`
+(a market's xi, or the mean of the free xi).
 """
 from __future__ import annotations
 
@@ -81,8 +82,8 @@ def _s_jt(delta_inside, sigma, xi, x_jg, nu_i, w_i, availability_matrix):
 
 
 @jax.jit
-def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full):
-    """Diversion D_jk at xi=0. Shape (J, J).
+def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full, xi_d=0.0):
+    """Diversion D_jk at outside utility xi_d (default 0). Shape (J, J).
 
     D_jk = (1/s_j) sum_i w_i s_ij s_ik / (1 - s_ij), computed as one matrix
     product rather than by materializing the (I, J, J) individual-level tensor,
@@ -90,7 +91,7 @@ def _diversion_jk(delta_inside, sigma, x_jg, nu_i, w_i, availability_matrix_full
     availability). Same values, diagonal included.
     """
     avail_one = availability_matrix_full[:, :1]
-    S_ij = _s_ijt(delta_inside, sigma, jnp.zeros(1), x_jg, nu_i, avail_one)[:, :, 0]  # (I, J)
+    S_ij = _s_ijt(delta_inside, sigma, jnp.zeros(1) + xi_d, x_jg, nu_i, avail_one)[:, :, 0]  # (I, J)
     I = w_i.shape[0]
     S_j = w_i @ S_ij                                    # (J,)
 
@@ -115,8 +116,10 @@ class RandomCoefficients(DiscreteChoiceModel):
         w_i,
         market_fe=False,
         diversion_data=None,
+        diversion_market=None,
     ):
-        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data)
+        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data,
+                         diversion_market=diversion_market)
         self.x2 = jnp.array(x2)
         self.nu_i = jnp.array(nu_i)
         self.w_i = jnp.array(w_i)
@@ -153,7 +156,8 @@ class RandomCoefficients(DiscreteChoiceModel):
         p = self._unpack_theta(theta)
         return _diversion_jk(p["delta_inside"], p["sigma"],
                               self.x2, self.nu_i, self.w_i,
-                              self._availability_matrix_full)
+                              self._availability_matrix_full,
+                              self._xi_for_diversion(p["xi"]))
 
     def _make_x0(self, rng):
         delta = rng.uniform(-5, -3, self.J - 1)

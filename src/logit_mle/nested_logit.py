@@ -25,7 +25,8 @@ transparent to the user: theta is passed and returned in (delta, rho, xi)
 form everywhere.
 
 Diversion: closed-form formula from the paper appendix (tau_in/tau_out),
-evaluated at the xi=0 baseline. A vmap product-removal method is
+evaluated at the xi=0 baseline, or at the point set by `diversion_market`
+(a market's xi, or the mean of the free xi). A vmap product-removal method is
 also available for testing.
 """
 from __future__ import annotations
@@ -37,7 +38,7 @@ import jax.numpy as jnp
 
 jax.config.update("jax_enable_x64", True)
 
-from .base import DiscreteChoiceModel
+from .base import DiscreteChoiceModel, diversion_point
 
 UTILITY_PUNISH = -1e20
 
@@ -99,15 +100,17 @@ def _shares_decomposition_from_gamma(gamma_inside, rho, gamma_xi,
     return s_gjt, s_gt, s_jt
 
 
-def _diversion_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full):
-    """Closed-form diversion at xi=0 under full availability. Shape (J, J)."""
+def _diversion_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full,
+                          gamma_xi_d=0.0):
+    """Closed-form diversion under full availability at outside gamma_xi_d
+    (= xi / (1 - rho); default 0). Shape (J, J)."""
     J_in = gamma_inside.shape[0]
     J = J_in + 1
     T = availability_matrix_full.shape[1]
 
-    gamma_xi_zero = jnp.zeros(T)
+    gamma_xi = jnp.zeros(T) + gamma_xi_d
     s_gjt, s_gt, s_jt = _shares_decomposition_from_gamma(
-        gamma_inside, rho, gamma_xi_zero, nest_matrix, availability_matrix_full
+        gamma_inside, rho, gamma_xi, nest_matrix, availability_matrix_full
     )
 
     s_gj = s_gjt[:, :, 0]   # (G, J)
@@ -136,22 +139,24 @@ def _diversion_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_fu
     return D
 
 
-def _diversion_vmap_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full):
-    """Simulation-based diversion via vmap product removal at xi=0.
+def _diversion_vmap_from_gamma(gamma_inside, rho, nest_matrix, availability_matrix_full,
+                               gamma_xi_d=0.0):
+    """Simulation-based diversion via vmap product removal at outside gamma_xi_d
+    (default 0).
 
     Slower than the closed form -- mainly for testing.
     """
     J, T = availability_matrix_full.shape
-    gamma_xi_zero = jnp.zeros(T)
+    gamma_xi = jnp.zeros(T) + gamma_xi_d
 
     s_jt = _shares_from_gamma(
-        gamma_inside, rho, gamma_xi_zero, nest_matrix, availability_matrix_full
+        gamma_inside, rho, gamma_xi, nest_matrix, availability_matrix_full
     )
 
     def shares_with_j_removed(j):
         new_avail = availability_matrix_full.at[j, :].set(False)
         return _shares_from_gamma(
-            gamma_inside, rho, gamma_xi_zero, nest_matrix, new_avail
+            gamma_inside, rho, gamma_xi, nest_matrix, new_avail
         )
 
     S_rjt = jax.vmap(shares_with_j_removed)(jnp.arange(J))
@@ -194,8 +199,10 @@ class NestedLogit(DiscreteChoiceModel):
         nesting_ids,
         market_fe=False,
         diversion_data=None,
+        diversion_market=None,
     ):
-        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data)
+        super().__init__(availability_matrix, q_jt, diversion_data=diversion_data,
+                         diversion_market=diversion_market)
         nesting_ids = np.asarray(nesting_ids)
         self.nest_matrix = self._build_nest_matrix(nesting_ids)
         self.G = self.nest_matrix.shape[0]
@@ -290,10 +297,12 @@ class NestedLogit(DiscreteChoiceModel):
         )
 
     def _compute_diversion(self, theta):
-        """Closed-form diversion at xi=0 under full availability. Shape (J, J)."""
-        gamma_inside, rho, _ = self._gamma_components(theta)
+        """Closed-form diversion under full availability at the diversion market's
+        xi (0 by default). Shape (J, J)."""
+        gamma_inside, rho, gamma_xi = self._gamma_components(theta)
         return _diversion_from_gamma(
-            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full
+            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full,
+            self._xi_for_diversion(gamma_xi)
         )
 
     # ── Starting values & bounds (user-form / delta-form) ────────
@@ -371,6 +380,7 @@ class NestedLogit(DiscreteChoiceModel):
         T = self.T
         market_fe = self.market_fe
         div_data = self._diversion_data
+        dm = self.diversion_market
 
         if aug_div:
             if diversion_rows is None:
@@ -401,7 +411,8 @@ class NestedLogit(DiscreteChoiceModel):
                 return -model_ll
 
             D_jk = _diversion_from_gamma(
-                gamma_inside, rho, nest_matrix, avail_full
+                gamma_inside, rho, nest_matrix, avail_full,
+                diversion_point(gamma_xi, dm)
             )
             D_jk = D_jk.at[jnp.diag_indices_from(D_jk)].set(0.0)
             D_jk_safe = jnp.where(D_jk == 0, 1.0, D_jk)
@@ -471,19 +482,21 @@ class NestedLogit(DiscreteChoiceModel):
         )
 
     def compute_diversion_matrix_from_formula(self, theta):
-        """Closed-form diversion at xi=0. Alias for diversion_matrix()."""
+        """Closed-form diversion (see diversion_matrix). Alias for diversion_matrix()."""
         return self.diversion_matrix(theta)
 
     def compute_diversion_matrix_vmap(self, theta):
-        """Simulation-based diversion via product removal at xi=0. Shape (J, J).
+        """Simulation-based diversion via product removal, at the same xi as
+        diversion_matrix(). Shape (J, J).
 
-        Uses market 0 (all markets equivalent under full availability at xi=0).
+        Uses market 0 (all markets equivalent under full availability at a common xi).
         Slower than the formula -- mainly for testing.
         """
         theta = jnp.asarray(theta)
-        gamma_inside, rho, _ = self._gamma_components(theta)
+        gamma_inside, rho, gamma_xi = self._gamma_components(theta)
         D_jkt = _diversion_vmap_from_gamma(
-            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full
+            gamma_inside, rho, self.nest_matrix, self._availability_matrix_full,
+            self._xi_for_diversion(gamma_xi)
         )
         return D_jkt[:, :, 0]
 
